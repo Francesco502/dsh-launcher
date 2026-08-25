@@ -108,6 +108,7 @@ const HOVER_STEPS: usize = 4;
 const WINDOW_CLASS: &str = "DeepSeekHarnessDshControlWindow";
 const WINDOW_TITLE: &str = "DSH 服务管理";
 const ICON_RESOURCE_ID: usize = 1;
+const GRAYSCALE_ICON_RESOURCE_ID: usize = 2;
 const WINDOW_WIDTH: i32 = 620;
 const WINDOW_HEIGHT: i32 = 460;
 const BUTTON_STYLE: u32 = BS_OWNERDRAW as u32;
@@ -169,6 +170,8 @@ impl Action {
 
 struct AppState {
     hicon: usize,
+    gray_hicon: usize,
+    tray_hicon: AtomicUsize,
     background_brush: usize,
     title_font: usize,
     body_font: usize,
@@ -1110,6 +1113,24 @@ fn dsh_web_health_status() -> String {
     }
 }
 
+fn tray_icon_running_state(status: &str) -> Option<bool> {
+    if status.starts_with("服务运行中")
+        || status.starts_with("服务已启动")
+        || status.starts_with("服务已在运行")
+    {
+        Some(true)
+    } else if status.starts_with("服务响应异常")
+        || status.starts_with("端口 3080 被其他服务占用")
+        || status.starts_with("服务未启动")
+        || status.starts_with("服务已停止")
+        || status.starts_with("服务当前未运行")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn open_web_ui() -> Result<String, String> {
     let status = http_status(DSH_PORT, "/")?;
     if !is_successful_http_status(status) {
@@ -1142,8 +1163,9 @@ fn hidden_command(program: impl AsRef<OsStr>) -> Command {
 
 fn run_app() -> Result<(), String> {
     let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
-    let hicon = unsafe { load_app_icon(hinstance) };
-    if hicon.is_null() {
+    let hicon = unsafe { load_app_icon(hinstance, ICON_RESOURCE_ID) };
+    let gray_hicon = unsafe { load_app_icon(hinstance, GRAYSCALE_ICON_RESOURCE_ID) };
+    if hicon.is_null() || gray_hicon.is_null() {
         return Err("无法加载应用图标".to_owned());
     }
 
@@ -1201,8 +1223,15 @@ fn run_app() -> Result<(), String> {
     }
 
     let initial_status = dsh_web_health_status();
+    let initial_tray_icon = if tray_icon_running_state(&initial_status) == Some(true) {
+        hicon
+    } else {
+        gray_hicon
+    };
     let shared = Arc::new(AppState {
         hicon: hicon as usize,
+        gray_hicon: gray_hicon as usize,
+        tray_hicon: AtomicUsize::new(initial_tray_icon as usize),
         background_brush: background_brush as usize,
         title_font: title_font as usize,
         body_font: body_font as usize,
@@ -1298,7 +1327,13 @@ fn run_app() -> Result<(), String> {
         SetTimer(hwnd, HEALTH_TIMER_ID, HEALTH_TIMER_INTERVAL_MS, None);
     }
 
-    let tray_result = unsafe { add_tray_icon(hwnd, hicon, "DSH Launcher - 就绪") };
+    let tray_result = unsafe {
+        add_tray_icon(
+            hwnd,
+            shared.tray_hicon.load(Ordering::Acquire) as HICON,
+            "DSH Launcher - 就绪",
+        )
+    };
     if tray_result == 0 {
         eprintln!(
             "添加托盘图标失败: last_error={}, hwnd=0x{:x}, hicon=0x{:x}, notify_size={}",
@@ -1347,8 +1382,11 @@ fn show_error_box(error: &str) {
     }
 }
 
-unsafe fn load_app_icon(hinstance: windows_sys::Win32::Foundation::HINSTANCE) -> HICON {
-    let embedded = LoadIconW(hinstance, ICON_RESOURCE_ID as *const u16);
+unsafe fn load_app_icon(
+    hinstance: windows_sys::Win32::Foundation::HINSTANCE,
+    resource_id: usize,
+) -> HICON {
+    let embedded = LoadIconW(hinstance, resource_id as *const u16);
     if embedded.is_null() {
         LoadIconW(std::ptr::null_mut(), IDI_APPLICATION)
     } else {
@@ -2166,7 +2204,20 @@ unsafe extern "system" fn window_proc(
                     .and_then(|mut messages| messages.pop_back());
                 if let Some(message) = latest {
                     set_status_text(&state, &message);
-                    let _ = update_tray_tooltip(hwnd, state.hicon as HICON, &message);
+                    if let Some(running) = tray_icon_running_state(&message) {
+                        let icon = if running {
+                            state.hicon
+                        } else {
+                            state.gray_hicon
+                        };
+                        state.tray_hicon.store(icon, Ordering::Release);
+                        let _ = update_tray_icon(hwnd, icon as HICON);
+                    }
+                    let _ = update_tray_tooltip(
+                        hwnd,
+                        state.tray_hicon.load(Ordering::Acquire) as HICON,
+                        &message,
+                    );
                     set_action_buttons_enabled(hwnd, !state.busy.load(Ordering::Acquire));
                 }
             }
@@ -2175,7 +2226,11 @@ unsafe extern "system" fn window_proc(
         WM_TIMER if wparam == TRAY_RETRY_TIMER_ID => {
             if let Some(state) = state_for(hwnd) {
                 if !state.tray_added.load(Ordering::Acquire) {
-                    let result = add_tray_icon(hwnd, state.hicon as HICON, "DSH Launcher");
+                    let result = add_tray_icon(
+                        hwnd,
+                        state.tray_hicon.load(Ordering::Acquire) as HICON,
+                        "DSH Launcher",
+                    );
                     if result != 0 {
                         state.tray_added.store(true, Ordering::Release);
                         KillTimer(hwnd, TRAY_RETRY_TIMER_ID);
@@ -2410,6 +2465,12 @@ unsafe fn update_tray_tooltip(hwnd: HWND, hicon: HICON, tooltip: &str) -> i32 {
     Shell_NotifyIconW(NIM_MODIFY, &data)
 }
 
+unsafe fn update_tray_icon(hwnd: HWND, hicon: HICON) -> i32 {
+    let mut data = notify_data(hwnd, hicon);
+    data.uFlags = NIF_ICON;
+    Shell_NotifyIconW(NIM_MODIFY, &data)
+}
+
 unsafe fn delete_tray_icon(hwnd: HWND) {
     let data = notify_data(hwnd, std::ptr::null_mut());
     Shell_NotifyIconW(NIM_DELETE, &data);
@@ -2495,6 +2556,24 @@ mod tests {
         assert!(is_successful_http_status(302));
         assert!(!is_successful_http_status(404));
         assert!(!is_successful_http_status(500));
+    }
+
+    #[test]
+    fn tray_icon_follows_dsh_health_and_known_actions() {
+        assert_eq!(
+            tray_icon_running_state("服务运行中 · http://127.0.0.1:3080"),
+            Some(true)
+        );
+        assert_eq!(
+            tray_icon_running_state("服务已启动 · http://127.0.0.1:3080"),
+            Some(true)
+        );
+        assert_eq!(
+            tray_icon_running_state("服务响应异常 · HTTP 500"),
+            Some(false)
+        );
+        assert_eq!(tray_icon_running_state("服务未启动"), Some(false));
+        assert_eq!(tray_icon_running_state("更新失败：网络错误"), None);
     }
 
     #[test]

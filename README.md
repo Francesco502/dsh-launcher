@@ -36,4 +36,4 @@ The release executable is:
 
 The packaged desktop copy is `%USERPROFILE%\Desktop\DSH-Launcher.exe`.
 
-The icon embedder writes a custom multi-size DSH icon into the release executable. The `--action start|restart|stop|upgrade|open` command-line modes are included for automation and verification; normal launch without arguments opens the main window.
+The icon embedder writes custom multi-size color and grayscale DSH icons into the release executable. The tray icon stays colored while DSH is healthy and switches to the grayscale resource when DSH is unavailable or unhealthy. The `--action start|restart|stop|upgrade|open` command-line modes are included for automation and verification; normal launch without arguments opens the main window.

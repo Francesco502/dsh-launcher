@@ -10,6 +10,10 @@ use windows_sys::Win32::System::LibraryLoader::{
 const RT_ICON: usize = 3;
 const RT_GROUP_ICON: usize = 14;
 const ICON_SIZES: [u32; 4] = [16, 32, 48, 256];
+const COLOR_ICON_GROUP_ID: usize = 1;
+const GRAYSCALE_ICON_GROUP_ID: usize = 2;
+const COLOR_ICON_RESOURCE_BASE: usize = 1;
+const GRAYSCALE_ICON_RESOURCE_BASE: usize = 101;
 
 fn main() {
     let path = env::args_os()
@@ -20,8 +24,16 @@ fn main() {
         panic!("executable not found: {}", path.display());
     }
 
-    let images: Vec<Vec<u8>> = ICON_SIZES.into_iter().map(generate_icon_dib).collect();
-    let group = make_group_icon(&images);
+    let images: Vec<Vec<u8>> = ICON_SIZES
+        .into_iter()
+        .map(|size| generate_icon_dib(size, false))
+        .collect();
+    let grayscale_images: Vec<Vec<u8>> = ICON_SIZES
+        .into_iter()
+        .map(|size| generate_icon_dib(size, true))
+        .collect();
+    let group = make_group_icon(&images, COLOR_ICON_RESOURCE_BASE);
+    let grayscale_group = make_group_icon(&grayscale_images, GRAYSCALE_ICON_RESOURCE_BASE);
     let path_wide = to_wide(&path.to_string_lossy());
 
     unsafe {
@@ -34,7 +46,7 @@ fn main() {
             if UpdateResourceW(
                 update,
                 resource_id(RT_ICON),
-                resource_id(index + 1),
+                resource_id(COLOR_ICON_RESOURCE_BASE + index),
                 0,
                 image.as_ptr().cast::<c_void>(),
                 image.len() as u32,
@@ -46,10 +58,26 @@ fn main() {
             }
         }
 
+        for (index, image) in grayscale_images.iter().enumerate() {
+            if UpdateResourceW(
+                update,
+                resource_id(RT_ICON),
+                resource_id(GRAYSCALE_ICON_RESOURCE_BASE + index),
+                0,
+                image.as_ptr().cast::<c_void>(),
+                image.len() as u32,
+            ) == 0
+            {
+                let error = GetLastError();
+                EndUpdateResourceW(update, 1);
+                panic!("UpdateResourceW(grayscale RT_ICON) failed: {error}");
+            }
+        }
+
         if UpdateResourceW(
             update,
             resource_id(RT_GROUP_ICON),
-            resource_id(1),
+            resource_id(COLOR_ICON_GROUP_ID),
             0,
             group.as_ptr().cast::<c_void>(),
             group.len() as u32,
@@ -60,6 +88,20 @@ fn main() {
             panic!("UpdateResourceW(RT_GROUP_ICON) failed: {error}");
         }
 
+        if UpdateResourceW(
+            update,
+            resource_id(RT_GROUP_ICON),
+            resource_id(GRAYSCALE_ICON_GROUP_ID),
+            0,
+            grayscale_group.as_ptr().cast::<c_void>(),
+            grayscale_group.len() as u32,
+        ) == 0
+        {
+            let error = GetLastError();
+            EndUpdateResourceW(update, 1);
+            panic!("UpdateResourceW(grayscale RT_GROUP_ICON) failed: {error}");
+        }
+
         if EndUpdateResourceW(update, 0) == 0 {
             panic!("EndUpdateResourceW failed: {}", GetLastError());
         }
@@ -68,7 +110,7 @@ fn main() {
     println!("embedded DSH icon into {}", path.display());
 }
 
-fn generate_icon_dib(size: u32) -> Vec<u8> {
+fn generate_icon_dib(size: u32, grayscale: bool) -> Vec<u8> {
     let mut output = Vec::with_capacity((40 + size * size * 4) as usize);
     push_u32(&mut output, 40);
     push_i32(&mut output, size as i32);
@@ -86,7 +128,7 @@ fn generate_icon_dib(size: u32) -> Vec<u8> {
     for bottom_y in 0..size {
         let y = size - 1 - bottom_y;
         for x in 0..size {
-            let [red, green, blue, opacity] = sample_pixel(x, y, size);
+            let [red, green, blue, opacity] = sample_pixel(x, y, size, grayscale);
             output.extend_from_slice(&[blue, green, red, opacity]);
             alpha[(y * size + x) as usize] = opacity;
         }
@@ -106,7 +148,7 @@ fn generate_icon_dib(size: u32) -> Vec<u8> {
     output
 }
 
-fn sample_pixel(x: u32, y: u32, size: u32) -> [u8; 4] {
+fn sample_pixel(x: u32, y: u32, size: u32, grayscale: bool) -> [u8; 4] {
     const SAMPLES: u32 = 4;
     let mut alpha_sum = 0.0f32;
     let mut red_sum = 0.0f32;
@@ -130,12 +172,21 @@ fn sample_pixel(x: u32, y: u32, size: u32) -> [u8; 4] {
     if alpha <= f32::EPSILON {
         return [0, 0, 0, 0];
     }
-    [
+    let [red, green, blue] = [
         (red_sum / alpha_sum).round() as u8,
         (green_sum / alpha_sum).round() as u8,
         (blue_sum / alpha_sum).round() as u8,
-        (alpha * 255.0).round() as u8,
-    ]
+    ];
+    if grayscale {
+        let value = grayscale_value(red, green, blue);
+        [value, value, value, (alpha * 255.0).round() as u8]
+    } else {
+        [red, green, blue, (alpha * 255.0).round() as u8]
+    }
+}
+
+fn grayscale_value(red: u8, green: u8, blue: u8) -> u8 {
+    ((u32::from(red) * 77 + u32::from(green) * 150 + u32::from(blue) * 29 + 128) / 256) as u8
 }
 
 fn vector_color(x: f32, y: f32) -> [f32; 4] {
@@ -171,7 +222,7 @@ fn vector_color(x: f32, y: f32) -> [f32; 4] {
     }
 }
 
-fn make_group_icon(images: &[Vec<u8>]) -> Vec<u8> {
+fn make_group_icon(images: &[Vec<u8>], resource_base: usize) -> Vec<u8> {
     let mut group = Vec::with_capacity(6 + images.len() * 14);
     push_u16(&mut group, 0);
     push_u16(&mut group, 1);
@@ -184,7 +235,7 @@ fn make_group_icon(images: &[Vec<u8>]) -> Vec<u8> {
         push_u16(&mut group, 1);
         push_u16(&mut group, 32);
         push_u32(&mut group, image.len() as u32);
-        push_u16(&mut group, (index + 1) as u16);
+        push_u16(&mut group, (resource_base + index) as u16);
     }
     group
 }
@@ -215,16 +266,42 @@ mod tests {
 
     #[test]
     fn icon_dib_has_header_pixels_and_mask() {
-        let icon = generate_icon_dib(16);
+        let icon = generate_icon_dib(16, false);
         assert_eq!(&icon[0..4], &40u32.to_le_bytes());
         assert!(icon.len() > 40 + 16 * 16 * 4);
     }
 
     #[test]
     fn group_icon_references_all_images() {
-        let images: Vec<Vec<u8>> = ICON_SIZES.into_iter().map(generate_icon_dib).collect();
-        let group = make_group_icon(&images);
+        let images: Vec<Vec<u8>> = ICON_SIZES
+            .into_iter()
+            .map(|size| generate_icon_dib(size, false))
+            .collect();
+        let group = make_group_icon(&images, COLOR_ICON_RESOURCE_BASE);
         assert_eq!(&group[4..6], &(images.len() as u16).to_le_bytes());
         assert_eq!(group.len(), 6 + images.len() * 14);
+    }
+
+    #[test]
+    fn grayscale_icon_pixels_have_equal_channels() {
+        let color = generate_icon_dib(16, false);
+        let grayscale = generate_icon_dib(16, true);
+        let color_pixels = &color[40..40 + 16 * 16 * 4];
+        let grayscale_pixels = &grayscale[40..40 + 16 * 16 * 4];
+        for (color_pixel, grayscale_pixel) in color_pixels
+            .chunks_exact(4)
+            .zip(grayscale_pixels.chunks_exact(4))
+        {
+            assert_eq!(color_pixel[3], grayscale_pixel[3]);
+            assert_eq!(grayscale_pixel[0], grayscale_pixel[1]);
+            assert_eq!(grayscale_pixel[1], grayscale_pixel[2]);
+        }
+    }
+
+    #[test]
+    fn grayscale_conversion_uses_luminance() {
+        assert_eq!(grayscale_value(255, 0, 0), 77);
+        assert_eq!(grayscale_value(0, 255, 0), 149);
+        assert_eq!(grayscale_value(0, 0, 255), 29);
     }
 }
