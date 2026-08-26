@@ -2,7 +2,7 @@
 
 `dsh-launcher.exe` is a small native Windows control application for the Windows-native DeepSeek Harness installation.
 
-当前应用版本：`0.1.1`。
+当前应用版本以 `Cargo.toml` 的 `[package].version` 为唯一来源；版本和发布规则见 [`VERSIONING.md`](VERSIONING.md)，变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 This project targets local DSH lifecycle management: install/update, start, restart, stop, and open the Web UI. The current launcher requires the portable Node/npm runtime to be provisioned under `%LOCALAPPDATA%\DSH-Runtime`; its update flow stages and validates a package before promotion, while standalone first-run runtime provisioning is not yet exposed as a separate action.
 
@@ -42,11 +42,11 @@ The icon embedder writes custom multi-size color and grayscale DSH icons into th
 
 ## 启动器自身更新
 
-托盘菜单中的 `检查启动器更新` 会读取本项目的公开 GitHub Release。只有 Release 版本高于当前版本时才会执行更新；程序会下载并校验以下两个资产：
+托盘菜单中的 `检查启动器更新` 会读取本项目的公开 GitHub Release。只有 Release 版本高于当前版本时才会执行更新；程序会下载并校验以下两个固定资产：
 
 - `DSH-Launcher.exe`
 - `DSH-Launcher.exe.sha256`
 
 校验通过后，启动器复制自身为临时更新助手，退出当前进程，由助手替换旧 EXE 并重新启动。网络失败、版本不高或 SHA-256 不匹配都不会修改当前 EXE。命令行等价入口为 `--action launcher-update`。
 
-推送 `v*.*.*` 标签会触发 `.github/workflows/release.yml`：它校验标签与 `Cargo.toml` 版本一致，构建并嵌入图标，然后发布上述两个资产。首个基线版本为 `v0.1.0`，当前修复版本为 `v0.1.1`；应用能够更新到后续 Release，但不会把 DSH 包更新误认为启动器更新。
+推送符合 `vMAJOR.MINOR.PATCH` 的标签会触发 `.github/workflows/release.yml`：它执行版本、格式、测试和 Windows release build 门禁，嵌入图标，生成 `release-manifest.json`，然后发布上述三个资产。应用能够更新到后续启动器 Release，但不会把 DSH 包更新误认为启动器更新。

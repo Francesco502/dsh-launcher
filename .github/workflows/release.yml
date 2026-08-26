@@ -5,29 +5,32 @@ on:
     tags:
       - "v*.*.*"
 
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
   release:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-gnu
 
-      - name: Check tag version
+      - name: Validate release metadata
         shell: pwsh
         run: |
-          $tagVersion = $env:GITHUB_REF_NAME.TrimStart('v')
-          $packageVersion = ((cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Select-Object -First 1).version
-          if ($tagVersion -ne $packageVersion) {
-            throw "Git tag $($env:GITHUB_REF_NAME) does not match Cargo package version $packageVersion"
-          }
+          & .github\scripts\validate-release.ps1 -Tag $env:GITHUB_REF_NAME
 
       - name: Format check
         run: cargo fmt --check --all
@@ -47,10 +50,44 @@ jobs:
       - name: Prepare update assets
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $releaseDir = "target\x86_64-pc-windows-gnu\release"
-          Copy-Item -LiteralPath "$releaseDir\dsh-launcher.exe" -Destination "DSH-Launcher.exe" -Force
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "DSH-Launcher.exe").Hash.ToLowerInvariant()
-          "$hash  DSH-Launcher.exe" | Set-Content -LiteralPath "DSH-Launcher.exe.sha256" -Encoding ascii -NoNewline
+          $distDir = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Path $distDir -Force | Out-Null
+          $exePath = Join-Path $distDir "DSH-Launcher.exe"
+          $checksumPath = Join-Path $distDir "DSH-Launcher.exe.sha256"
+          $manifestPath = Join-Path $distDir "release-manifest.json"
+          Copy-Item -LiteralPath "$releaseDir\dsh-launcher.exe" -Destination $exePath -Force
+          $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exePath).Hash.ToLowerInvariant()
+          "$exeHash  DSH-Launcher.exe" | Set-Content -LiteralPath $checksumPath -Encoding ascii -NoNewline
+          $checksumHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $checksumPath).Hash.ToLowerInvariant()
+          $tagVersion = $env:GITHUB_REF_NAME.Substring(1)
+          $manifest = [ordered]@{
+            schema_version = 1
+            project = "Francesco502/dsh-launcher"
+            version = $tagVersion
+            tag = $env:GITHUB_REF_NAME
+            commit = $env:GITHUB_SHA
+            target = "x86_64-pc-windows-gnu"
+            assets = @(
+              [ordered]@{
+                name = "DSH-Launcher.exe"
+                sha256 = $exeHash
+                type = "application/vnd.microsoft.portable-executable"
+              }
+              [ordered]@{
+                name = "DSH-Launcher.exe.sha256"
+                sha256 = $checksumHash
+                type = "text/plain"
+              }
+            )
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+          $actualAssetNames = @(Get-ChildItem -LiteralPath $distDir -File | Select-Object -ExpandProperty Name | Sort-Object)
+          $expectedAssetNames = @("DSH-Launcher.exe", "DSH-Launcher.exe.sha256", "release-manifest.json") | Sort-Object
+          if (($actualAssetNames -join "|") -ne ($expectedAssetNames -join "|")) {
+            throw "Release asset set is not exactly the required three files: $($actualAssetNames -join ', ')"
+          }
 
       - name: Publish GitHub Release
         shell: pwsh
@@ -58,6 +95,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           $repository = "Francesco502/dsh-launcher"
+          $distDir = Join-Path $PWD "dist"
           $headers = @{
             Accept = "application/vnd.github+json"
             Authorization = "Bearer $env:GITHUB_TOKEN"
@@ -73,13 +111,13 @@ jobs:
           $release = Invoke-RestMethod -Method Post -Uri $releaseApi -Headers $headers -ContentType "application/json" -Body $releaseBody
           $uploadApi = $release.upload_url.Split('{')[0]
 
-          foreach ($assetName in @("DSH-Launcher.exe", "DSH-Launcher.exe.sha256")) {
-            $assetPath = Join-Path $PWD $assetName
+          foreach ($assetPath in (Get-ChildItem -LiteralPath $distDir -File)) {
+            $assetName = $assetPath.Name
             $assetUrl = "$uploadApi`?name=$([uri]::EscapeDataString($assetName))"
-            $contentType = if ($assetName.EndsWith(".exe")) {
-              "application/vnd.microsoft.portable-executable"
-            } else {
-              "text/plain"
+            $contentType = switch -Wildcard ($assetName) {
+              "*.exe" { "application/vnd.microsoft.portable-executable"; break }
+              "*.json" { "application/json"; break }
+              default { "text/plain" }
             }
-            Invoke-RestMethod -Method Post -Uri $assetUrl -Headers $headers -ContentType $contentType -InFile $assetPath | Out-Null
+            Invoke-RestMethod -Method Post -Uri $assetUrl -Headers $headers -ContentType $contentType -InFile $assetPath.FullName | Out-Null
           }
