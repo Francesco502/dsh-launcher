@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+
+      - name: Check tag version
+        shell: pwsh
+        run: |
+          $tagVersion = $env:GITHUB_REF_NAME.TrimStart('v')
+          $packageVersion = ((cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Select-Object -First 1).version
+          if ($tagVersion -ne $packageVersion) {
+            throw "Git tag $($env:GITHUB_REF_NAME) does not match Cargo package version $packageVersion"
+          }
+
+      - name: Format check
+        run: cargo fmt --check --all
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build Windows release
+        run: cargo build --locked --release --target x86_64-pc-windows-gnu --bins
+
+      - name: Embed application icons
+        shell: pwsh
+        run: |
+          $releaseDir = "target\x86_64-pc-windows-gnu\release"
+          & "$releaseDir\embed_icon.exe" "$releaseDir\dsh-launcher.exe"
+
+      - name: Prepare update assets
+        shell: pwsh
+        run: |
+          $releaseDir = "target\x86_64-pc-windows-gnu\release"
+          Copy-Item -LiteralPath "$releaseDir\dsh-launcher.exe" -Destination "DSH-Launcher.exe" -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "DSH-Launcher.exe").Hash.ToLowerInvariant()
+          "$hash  DSH-Launcher.exe" | Set-Content -LiteralPath "DSH-Launcher.exe.sha256" -Encoding ascii -NoNewline
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $repository = "Francesco502/dsh-launcher"
+          $headers = @{
+            Accept = "application/vnd.github+json"
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            "X-GitHub-Api-Version" = "2022-11-28"
+            "User-Agent" = "DSH-Launcher-Release"
+          }
+          $releaseApi = "https://api.github.com/repos/$repository/releases"
+          $releaseBody = @{
+            tag_name = $env:GITHUB_REF_NAME
+            name = $env:GITHUB_REF_NAME
+            generate_release_notes = $true
+          } | ConvertTo-Json
+          $release = Invoke-RestMethod -Method Post -Uri $releaseApi -Headers $headers -ContentType "application/json" -Body $releaseBody
+          $uploadApi = $release.upload_url.Split('{')[0]
+
+          foreach ($assetName in @("DSH-Launcher.exe", "DSH-Launcher.exe.sha256")) {
+            $assetPath = Join-Path $PWD $assetName
+            $assetUrl = "$uploadApi`?name=$([uri]::EscapeDataString($assetName))"
+            $contentType = if ($assetName.EndsWith(".exe")) {
+              "application/vnd.microsoft.portable-executable"
+            } else {
+              "text/plain"
+            }
+            Invoke-RestMethod -Method Post -Uri $assetUrl -Headers $headers -ContentType $contentType -InFile $assetPath | Out-Null
+          }

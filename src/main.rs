@@ -31,6 +31,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, GRADIENT_FILL_RECT_V,
     GRADIENT_RECT, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT, TRIVERTEX,
 };
+use windows_sys::Win32::Storage::FileSystem::{
+    MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING,
+};
 use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_OWNERDRAW};
@@ -79,11 +82,24 @@ const WEB_URL: &str = "http://127.0.0.1:3080/";
 const QUOTA_CONFIG_PATH: &str = "/api/dsh-quota/config";
 const DSH_LATEST_REGISTRY_URL: &str = "https://registry.npmjs.org/@deepseek-ai%2fdsh/latest";
 const DSH_LATEST_VERSION_SCRIPT: &str = "fetch(process.argv[1],{signal:AbortSignal.timeout(10000)}).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(p=>console.log(p.version)).catch(e=>{console.error(e.message);process.exit(1)})";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LAUNCHER_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/Francesco502/dsh-launcher/releases/latest";
+const LAUNCHER_ASSET_NAME: &str = "DSH-Launcher.exe";
+const LAUNCHER_CHECKSUM_ASSET_NAME: &str = "DSH-Launcher.exe.sha256";
+const LAUNCHER_ASSET_URL_PREFIX: &str =
+    "https://github.com/Francesco502/dsh-launcher/releases/download/";
+const SELF_UPDATE_NEW_FILE: &str = "DSH-Launcher.exe.new";
+const SELF_UPDATE_CHECKSUM_FILE: &str = "DSH-Launcher.exe.sha256";
+const SELF_UPDATE_HELPER_FILE: &str = "DSH-Launcher.exe.helper.exe";
+const SELF_UPDATE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const SELF_UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const CREATE_NO_WINDOW_FLAG: u32 = CREATE_NO_WINDOW;
 
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const STATUS_MESSAGE: u32 = WM_APP + 2;
 const SHOW_WINDOW_MESSAGE: u32 = WM_APP + 3;
+const SELF_UPDATE_EXIT_MESSAGE: u32 = WM_APP + 4;
 const NIN_KEYSELECT: u32 = 1025;
 
 const CMD_START: u32 = 1001;
@@ -93,6 +109,7 @@ const CMD_UPGRADE: u32 = 1004;
 const CMD_EXIT: u32 = 1005;
 const CMD_SHOW: u32 = 1006;
 const CMD_OPEN_WEB: u32 = 1007;
+const CMD_LAUNCHER_UPDATE: u32 = 1008;
 const ID_TITLE: u32 = 1101;
 const ID_SUBTITLE: u32 = 1102;
 const ID_STATUS: u32 = 1103;
@@ -142,6 +159,7 @@ enum Action {
     Restart,
     Stop,
     Upgrade,
+    LauncherUpdate,
     OpenWeb,
 }
 
@@ -152,6 +170,7 @@ impl Action {
             "restart" => Some(Self::Restart),
             "stop" | "close" => Some(Self::Stop),
             "upgrade" | "update" => Some(Self::Upgrade),
+            "launcher-update" | "self-update" => Some(Self::LauncherUpdate),
             "open" | "web" => Some(Self::OpenWeb),
             _ => None,
         }
@@ -162,7 +181,8 @@ impl Action {
             Self::Start => "启动服务",
             Self::Restart => "重启服务",
             Self::Stop => "停止服务",
-            Self::Upgrade => "检查更新",
+            Self::Upgrade => "更新 DSH",
+            Self::LauncherUpdate => "更新启动器",
             Self::OpenWeb => "打开网页",
         }
     }
@@ -192,6 +212,26 @@ struct NativeDshProcess {
     started_at: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct LauncherVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+impl std::fmt::Display for LauncherVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LauncherRelease {
+    version: LauncherVersion,
+    asset_url: String,
+    checksum_url: String,
+}
+
 struct MutexGuard(HANDLE);
 
 impl Drop for MutexGuard {
@@ -205,6 +245,19 @@ impl Drop for MutexGuard {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if let Some((parent_pid, source, target)) = parse_self_update(&args) {
+        let code = match apply_self_update(parent_pid, &source, &target) {
+            Ok(message) => {
+                println!("{message}");
+                0
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     if let Some(action) = parse_action(&args) {
         attach_parent_console();
         let code = match ensure_not_elevated().and_then(|_| execute_action(action)) {
@@ -229,6 +282,14 @@ fn main() {
         show_error_box(&error);
         std::process::exit(1);
     }
+}
+
+fn parse_self_update(args: &[String]) -> Option<(u32, PathBuf, PathBuf)> {
+    if args.len() != 5 || args[1] != "--apply-self-update" {
+        return None;
+    }
+    let parent_pid = args[2].parse::<u32>().ok().filter(|pid| *pid != 0)?;
+    Some((parent_pid, PathBuf::from(&args[3]), PathBuf::from(&args[4])))
 }
 
 fn parse_action(args: &[String]) -> Option<Action> {
@@ -266,8 +327,262 @@ fn execute_action(action: Action) -> Result<String, String> {
         Action::Restart => restart_dsh(),
         Action::Stop => stop_dsh(),
         Action::Upgrade => upgrade_dsh(),
+        Action::LauncherUpdate => update_launcher(),
         Action::OpenWeb => open_web_ui(),
     }
+}
+
+fn update_launcher() -> Result<String, String> {
+    update_launcher_with_progress(&|_| {})
+}
+
+fn update_launcher_with_progress(progress: &dyn Fn(&str)) -> Result<String, String> {
+    progress("正在检查启动器更新...");
+    let release = latest_launcher_release()?;
+    let current_version = parse_launcher_version(APP_VERSION)
+        .ok_or_else(|| format!("当前启动器版本号无效：{APP_VERSION}"))?;
+    if release.version <= current_version {
+        return Ok(format!("启动器已是最新版本 · v{APP_VERSION}"));
+    }
+
+    progress(&format!("发现启动器 v{}，正在下载...", release.version));
+    let current_exe = env::current_exe().map_err(|error| format!("无法定位当前启动器：{error}"))?;
+    let update_directory = env::temp_dir().join(format!(
+        "dsh-launcher-update-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&update_directory)
+        .map_err(|error| format!("无法创建启动器更新暂存目录：{error}"))?;
+
+    let result = (|| {
+        let source = update_directory.join(SELF_UPDATE_NEW_FILE);
+        let checksum_file = update_directory.join(SELF_UPDATE_CHECKSUM_FILE);
+        let helper = update_directory.join(SELF_UPDATE_HELPER_FILE);
+        download_launcher_file(&release.asset_url, &source, "下载启动器更新")?;
+        download_launcher_file(&release.checksum_url, &checksum_file, "下载启动器校验文件")?;
+
+        progress("正在校验启动器更新...");
+        verify_launcher_download(&source, &checksum_file)?;
+        fs::copy(&current_exe, &helper)
+            .map_err(|error| format!("无法准备启动器更新助手：{error}"))?;
+
+        let parent_pid = std::process::id().to_string();
+        let mut command = hidden_command(&helper);
+        command
+            .arg("--apply-self-update")
+            .arg(parent_pid)
+            .arg(&source)
+            .arg(&current_exe);
+        command
+            .spawn()
+            .map_err(|error| format!("无法启动启动器更新助手：{error}"))?;
+
+        Ok(format!(
+            "已安排启动器更新到 v{}，程序将自动重启",
+            release.version
+        ))
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&update_directory);
+    }
+    result
+}
+
+fn latest_launcher_release() -> Result<LauncherRelease, String> {
+    let script = format!(
+        "$ErrorActionPreference = 'Stop';\n\
+         $headers = @{{ 'Accept' = 'application/vnd.github+json'; 'User-Agent' = {user_agent} }};\n\
+         $release = Invoke-RestMethod -Headers $headers -Uri {api_url} -TimeoutSec 30;\n\
+         $asset = @($release.assets | Where-Object {{ $_.name -eq {asset_name} }}) | Select-Object -First 1;\n\
+         $checksum = @($release.assets | Where-Object {{ $_.name -eq {checksum_name} }}) | Select-Object -First 1;\n\
+         if ($null -eq $asset -or $null -eq $checksum) {{ throw 'GitHub Release 缺少启动器或 SHA-256 资产' }};\n\
+         [Console]::WriteLine(\"$($release.tag_name)`t$($asset.browser_download_url)`t$($checksum.browser_download_url)\")",
+        user_agent = powershell_literal(&format!("DSH-Launcher/{APP_VERSION}")),
+        api_url = powershell_literal(LAUNCHER_RELEASE_API_URL),
+        asset_name = powershell_literal(LAUNCHER_ASSET_NAME),
+        checksum_name = powershell_literal(LAUNCHER_CHECKSUM_ASSET_NAME),
+    );
+    let output = run_powershell_script(&script, "检查启动器更新")?;
+    parse_launcher_release(&output)
+}
+
+fn parse_launcher_release(value: &str) -> Result<LauncherRelease, String> {
+    let line = value
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.split('\t').count() == 3)
+        .ok_or_else(|| "无法解析 GitHub Release 信息".to_owned())?;
+    let parts: Vec<&str> = line.split('\t').collect();
+    let version = parse_launcher_version(parts[0])
+        .ok_or_else(|| format!("GitHub Release 版本号无效：{}", parts[0]))?;
+    if !parts[1].starts_with(LAUNCHER_ASSET_URL_PREFIX)
+        || !parts[2].starts_with(LAUNCHER_ASSET_URL_PREFIX)
+    {
+        return Err("拒绝使用非本项目 GitHub Release 的更新资产".to_owned());
+    }
+    Ok(LauncherRelease {
+        version,
+        asset_url: parts[1].to_owned(),
+        checksum_url: parts[2].to_owned(),
+    })
+}
+
+fn parse_launcher_version(value: &str) -> Option<LauncherVersion> {
+    let value = value.trim().strip_prefix('v').unwrap_or(value.trim());
+    let mut parts = value.split('.');
+    let version = LauncherVersion {
+        major: parts.next()?.parse().ok()?,
+        minor: parts.next()?.parse().ok()?,
+        patch: parts.next()?.parse().ok()?,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(version)
+}
+
+fn download_launcher_file(url: &str, destination: &Path, description: &str) -> Result<(), String> {
+    if !url.starts_with(LAUNCHER_ASSET_URL_PREFIX) {
+        return Err("拒绝下载非本项目 GitHub Release 资产".to_owned());
+    }
+    let timeout = SELF_UPDATE_DOWNLOAD_TIMEOUT.as_secs();
+    let script = format!(
+        "$ErrorActionPreference = 'Stop';\n\
+         $ProgressPreference = 'SilentlyContinue';\n\
+         Invoke-WebRequest -UseBasicParsing -Headers @{{ 'Accept' = 'application/octet-stream'; 'User-Agent' = {user_agent} }} -Uri {url} -OutFile {destination} -TimeoutSec {timeout} | Out-Null",
+        user_agent = powershell_literal(&format!("DSH-Launcher/{APP_VERSION}")),
+        url = powershell_literal(url),
+        destination = powershell_literal(&destination.to_string_lossy()),
+    );
+    run_powershell_script(&script, description)?;
+    let metadata = fs::metadata(destination)
+        .map_err(|error| format!("{description}后无法读取文件：{error}"))?;
+    if metadata.len() == 0 {
+        return Err(format!("{description}得到空文件"));
+    }
+    Ok(())
+}
+
+fn verify_launcher_download(source: &Path, checksum_file: &Path) -> Result<(), String> {
+    let expected_text = fs::read_to_string(checksum_file)
+        .map_err(|error| format!("无法读取启动器 SHA-256 校验文件：{error}"))?;
+    let expected =
+        parse_sha256(&expected_text).ok_or_else(|| "启动器 SHA-256 校验文件格式无效".to_owned())?;
+    let actual = calculate_sha256(source)?;
+    if actual != expected {
+        return Err(format!(
+            "启动器更新校验失败：期望 {expected}，实际 {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_sha256(value: &str) -> Option<String> {
+    let value = value.split_whitespace().next()?;
+    if value.len() != 64 || !value.chars().all(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
+fn calculate_sha256(path: &Path) -> Result<String, String> {
+    let script = format!(
+        "$ErrorActionPreference = 'Stop';\n\
+         (Get-FileHash -Algorithm SHA256 -LiteralPath {path}).Hash",
+        path = powershell_literal(&path.to_string_lossy()),
+    );
+    let output = run_powershell_script(&script, "计算启动器 SHA-256")?;
+    parse_sha256(&output).ok_or_else(|| "无法解析启动器 SHA-256 结果".to_owned())
+}
+
+fn run_powershell_script(script: &str, description: &str) -> Result<String, String> {
+    let mut command = hidden_command("powershell.exe");
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        script,
+    ]);
+    run_native_command(&mut command, description)
+}
+
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn apply_self_update(parent_pid: u32, source: &Path, target: &Path) -> Result<String, String> {
+    wait_for_process_exit(parent_pid)?;
+    if !source.is_file() {
+        return Err("启动器更新文件不存在".to_owned());
+    }
+
+    let source_wide = to_wide(&source.to_string_lossy());
+    let target_wide = to_wide(&target.to_string_lossy());
+    let replaced = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    };
+    if replaced == 0 {
+        return Err(format!("替换启动器失败：{}", unsafe {
+            GetLastError()
+        }));
+    }
+
+    let mut command = hidden_command(target);
+    command
+        .spawn()
+        .map_err(|error| format!("启动更新后的启动器失败：{error}"))?;
+
+    if let Ok(helper) = env::current_exe() {
+        let helper_wide = to_wide(&helper.to_string_lossy());
+        unsafe {
+            let _ = MoveFileExW(
+                helper_wide.as_ptr(),
+                std::ptr::null(),
+                MOVEFILE_DELAY_UNTIL_REBOOT,
+            );
+        }
+    }
+    Ok("启动器更新完成".to_owned())
+}
+
+fn wait_for_process_exit(pid: u32) -> Result<(), String> {
+    let deadline = Instant::now() + SELF_UPDATE_WAIT_TIMEOUT;
+    while Instant::now() < deadline {
+        if !is_process_running(pid)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err("等待旧版启动器退出超时，更新未执行".to_owned())
+}
+
+fn is_process_running(pid: u32) -> Result<bool, String> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return Ok(false);
+    }
+    let mut exit_code = 0;
+    let result = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    if result == 0 {
+        return Err(format!("无法读取旧版启动器状态：{}", unsafe {
+            GetLastError()
+        }));
+    }
+    Ok(exit_code == PROCESS_STILL_ACTIVE)
 }
 
 fn attach_parent_console() {
@@ -1193,7 +1508,7 @@ fn run_app() -> Result<(), String> {
     }
 
     let class_name = to_wide(WINDOW_CLASS);
-    let window_title = to_wide(WINDOW_TITLE);
+    let window_title = to_wide(&format!("{WINDOW_TITLE} · v{APP_VERSION}"));
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: 0,
@@ -1439,6 +1754,8 @@ unsafe fn create_controls(
     hinstance: windows_sys::Win32::Foundation::HINSTANCE,
     state: &AppState,
 ) -> Result<(), String> {
+    let footer =
+        format!("DSH Launcher v{APP_VERSION} · 关闭窗口后仍在后台运行；托盘菜单可更新启动器");
     let controls = [
         create_control(
             hwnd,
@@ -1528,7 +1845,7 @@ unsafe fn create_controls(
             hwnd,
             hinstance,
             "BUTTON",
-            "检查更新",
+            "更新 DSH",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             310,
             280,
@@ -1540,7 +1857,7 @@ unsafe fn create_controls(
             hwnd,
             hinstance,
             "STATIC",
-            "关闭窗口后仍在后台运行",
+            &footer,
             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
             32,
             365,
@@ -1631,7 +1948,13 @@ unsafe fn set_status_text(state: &AppState, message: &str) {
 }
 
 unsafe fn set_action_buttons_enabled(hwnd: HWND, enabled: bool) {
-    for id in [CMD_START, CMD_STOP, CMD_RESTART, CMD_UPGRADE] {
+    for id in [
+        CMD_START,
+        CMD_STOP,
+        CMD_RESTART,
+        CMD_UPGRADE,
+        CMD_LAUNCHER_UPDATE,
+    ] {
         let control = GetDlgItem(hwnd, id as i32);
         if !control.is_null() {
             EnableWindow(control, enabled as i32);
@@ -2264,6 +2587,10 @@ unsafe extern "system" fn window_proc(
             show_main_window(hwnd);
             0
         }
+        SELF_UPDATE_EXIT_MESSAGE => {
+            DestroyWindow(hwnd);
+            0
+        }
         WM_CLOSE => {
             if let Some(state) = state_for(hwnd) {
                 if state.tray_added.load(Ordering::Acquire) {
@@ -2329,14 +2656,23 @@ fn spawn_action(hwnd: HWND, state: Arc<AppState>, action: Action) {
             Action::Upgrade => upgrade_dsh_with_progress(&|message| {
                 push_status(hwnd_value as HWND, &state, message.to_owned());
             }),
+            Action::LauncherUpdate => update_launcher_with_progress(&|message| {
+                push_status(hwnd_value as HWND, &state, message.to_owned());
+            }),
             _ => execute_action(action),
         };
+        let should_exit_for_update = matches!(action, Action::LauncherUpdate) && result.is_ok();
         state.busy.store(false, Ordering::Release);
         let message = match result {
             Ok(message) => message,
             Err(error) => error,
         };
         push_status(hwnd_value as HWND, &state, message);
+        if should_exit_for_update {
+            unsafe {
+                PostMessageW(hwnd_value as HWND, SELF_UPDATE_EXIT_MESSAGE, 0, 0);
+            }
+        }
     });
 }
 
@@ -2384,6 +2720,7 @@ fn action_from_command(command: u32) -> Option<Action> {
         CMD_RESTART => Some(Action::Restart),
         CMD_STOP => Some(Action::Stop),
         CMD_UPGRADE => Some(Action::Upgrade),
+        CMD_LAUNCHER_UPDATE => Some(Action::LauncherUpdate),
         CMD_OPEN_WEB => Some(Action::OpenWeb),
         _ => None,
     }
@@ -2415,7 +2752,8 @@ unsafe fn show_menu(hwnd: HWND) {
         (CMD_START, "启动服务"),
         (CMD_RESTART, "重启服务"),
         (CMD_STOP, "停止服务"),
-        (CMD_UPGRADE, "检查更新"),
+        (CMD_UPGRADE, "更新 DSH"),
+        (CMD_LAUNCHER_UPDATE, "检查启动器更新"),
         (CMD_EXIT, "退出"),
     ];
     let wide_labels: Vec<Vec<u16>> = labels.iter().map(|(_, label)| to_wide(label)).collect();
@@ -2514,9 +2852,34 @@ mod tests {
         assert!(Action::from_name("restart").is_some());
         assert!(Action::from_name("stop").is_some());
         assert!(Action::from_name("upgrade").is_some());
+        assert!(Action::from_name("launcher-update").is_some());
+        assert!(Action::from_name("self-update").is_some());
         assert!(Action::from_name("open").is_some());
         assert!(Action::from_name("web").is_some());
         assert!(Action::from_name("unknown").is_none());
+    }
+
+    #[test]
+    fn self_update_arguments_require_a_valid_parent_process() {
+        let args = vec![
+            "dsh-launcher.exe".to_owned(),
+            "--apply-self-update".to_owned(),
+            "42".to_owned(),
+            "new.exe".to_owned(),
+            "current.exe".to_owned(),
+        ];
+        assert_eq!(
+            parse_self_update(&args),
+            Some((42, PathBuf::from("new.exe"), PathBuf::from("current.exe")))
+        );
+        let invalid_pid = vec![
+            "dsh-launcher.exe".to_owned(),
+            "--apply-self-update".to_owned(),
+            "not-a-pid".to_owned(),
+            "new.exe".to_owned(),
+            "current.exe".to_owned(),
+        ];
+        assert!(parse_self_update(&invalid_pid).is_none());
     }
 
     #[test]
@@ -2574,6 +2937,55 @@ mod tests {
         );
         assert_eq!(tray_icon_running_state("服务未启动"), Some(false));
         assert_eq!(tray_icon_running_state("更新失败：网络错误"), None);
+    }
+
+    #[test]
+    fn launcher_versions_compare_release_tags() {
+        assert_eq!(
+            parse_launcher_version("v0.1.0"),
+            Some(LauncherVersion {
+                major: 0,
+                minor: 1,
+                patch: 0,
+            })
+        );
+        assert!(
+            parse_launcher_version("v0.1.1").unwrap() > parse_launcher_version("0.1.0").unwrap()
+        );
+        assert!(parse_launcher_version("0.1.0.1").is_none());
+        assert!(parse_launcher_version("v0.1.0-rc.1").is_none());
+    }
+
+    #[test]
+    fn launcher_release_parser_accepts_only_project_assets() {
+        let release = parse_launcher_release(
+            "v0.1.1\thttps://github.com/Francesco502/dsh-launcher/releases/download/v0.1.1/DSH-Launcher.exe\thttps://github.com/Francesco502/dsh-launcher/releases/download/v0.1.1/DSH-Launcher.exe.sha256\n",
+        )
+        .expect("release metadata should parse");
+        assert_eq!(release.version, parse_launcher_version("0.1.1").unwrap());
+        assert!(parse_launcher_release(
+            "v0.1.1\thttps://example.com/DSH-Launcher.exe\thttps://github.com/Francesco502/dsh-launcher/releases/download/v0.1.1/DSH-Launcher.exe.sha256"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn checksum_parser_accepts_common_sha256_manifest_lines() {
+        let hash = "A".repeat(64);
+        assert_eq!(
+            parse_sha256(&format!("{hash}  DSH-Launcher.exe")),
+            Some(hash.to_lowercase())
+        );
+        assert!(parse_sha256("not-a-sha256").is_none());
+        assert!(parse_sha256(&"a".repeat(63)).is_none());
+    }
+
+    #[test]
+    fn powershell_literals_escape_single_quotes() {
+        assert_eq!(
+            powershell_literal("C:\\DSH's\\launcher.exe"),
+            "'C:\\DSH''s\\launcher.exe'"
+        );
     }
 
     #[test]
