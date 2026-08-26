@@ -271,6 +271,24 @@ struct LauncherRelease {
     checksum_url: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LauncherUpdateOutcome {
+    UpToDate(String),
+    Scheduled(String),
+}
+
+impl LauncherUpdateOutcome {
+    fn should_exit(&self) -> bool {
+        matches!(self, Self::Scheduled(_))
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::UpToDate(message) | Self::Scheduled(message) => message,
+        }
+    }
+}
+
 struct MutexGuard(HANDLE);
 
 impl Drop for MutexGuard {
@@ -372,16 +390,18 @@ fn execute_action(action: Action) -> Result<String, String> {
 }
 
 fn update_launcher() -> Result<String, String> {
-    update_launcher_with_progress(&|_| {})
+    update_launcher_with_progress(&|_| {}).map(LauncherUpdateOutcome::into_message)
 }
 
-fn update_launcher_with_progress(progress: &dyn Fn(&str)) -> Result<String, String> {
+fn update_launcher_with_progress(progress: &dyn Fn(&str)) -> Result<LauncherUpdateOutcome, String> {
     progress("正在检查启动器更新...");
     let release = latest_launcher_release()?;
     let current_version = parse_launcher_version(APP_VERSION)
         .ok_or_else(|| format!("当前启动器版本号无效：{APP_VERSION}"))?;
     if release.version <= current_version {
-        return Ok(format!("启动器已是最新版本 · v{APP_VERSION}"));
+        return Ok(LauncherUpdateOutcome::UpToDate(format!(
+            "启动器已是最新版本 · v{APP_VERSION}"
+        )));
     }
 
     progress(&format!("发现启动器 v{}，正在下载...", release.version));
@@ -420,10 +440,10 @@ fn update_launcher_with_progress(progress: &dyn Fn(&str)) -> Result<String, Stri
             .spawn()
             .map_err(|error| format!("无法启动启动器更新助手：{error}"))?;
 
-        Ok(format!(
+        Ok(LauncherUpdateOutcome::Scheduled(format!(
             "已安排启动器更新到 v{}，程序将自动重启",
             release.version
-        ))
+        )))
     })();
 
     if result.is_err() {
@@ -2843,16 +2863,24 @@ fn spawn_action(hwnd: HWND, state: Arc<AppState>, action: Action) {
     push_status(hwnd, &state, format!("正在{}...", action.label()));
     let hwnd_value = hwnd as usize;
     thread::spawn(move || {
-        let result = match action {
-            Action::Upgrade => upgrade_dsh_with_progress(&|message| {
+        let (result, should_exit_for_update) = match action {
+            Action::Upgrade => (
+                upgrade_dsh_with_progress(&|message| {
+                    push_status(hwnd_value as HWND, &state, message.to_owned());
+                }),
+                false,
+            ),
+            Action::LauncherUpdate => match update_launcher_with_progress(&|message| {
                 push_status(hwnd_value as HWND, &state, message.to_owned());
-            }),
-            Action::LauncherUpdate => update_launcher_with_progress(&|message| {
-                push_status(hwnd_value as HWND, &state, message.to_owned());
-            }),
-            _ => execute_action(action),
+            }) {
+                Ok(outcome) => {
+                    let should_exit = outcome.should_exit();
+                    (Ok(outcome.into_message()), should_exit)
+                }
+                Err(error) => (Err(error), false),
+            },
+            _ => (execute_action(action), false),
         };
-        let should_exit_for_update = matches!(action, Action::LauncherUpdate) && result.is_ok();
         state.busy.store(false, Ordering::Release);
         let message = match result {
             Ok(message) => message,
@@ -3210,6 +3238,12 @@ mod tests {
             "v0.1.1\thttps://example.com/DSH-Launcher.exe\thttps://github.com/Francesco502/dsh-launcher/releases/download/v0.1.1/DSH-Launcher.exe.sha256"
         )
         .is_err());
+    }
+
+    #[test]
+    fn launcher_update_only_exits_after_scheduling_replacement() {
+        assert!(!LauncherUpdateOutcome::UpToDate("已是最新".to_owned()).should_exit());
+        assert!(LauncherUpdateOutcome::Scheduled("已安排更新".to_owned()).should_exit());
     }
 
     #[test]
