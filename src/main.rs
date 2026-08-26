@@ -35,11 +35,12 @@ use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT, MOVEFILE_REPLACE_EXISTING,
 };
 use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_OWNERDRAW};
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, GetExitCodeProcess, GetProcessTimes, OpenProcess, ReleaseMutex, CREATE_NO_WINDOW,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
@@ -61,6 +62,44 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SETFONT, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_TRANSPARENT,
     WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(
+        process_handle: HANDLE,
+        process_information_class: u32,
+        process_information: *mut c_void,
+        process_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessBasicInformation {
+    reserved1: *mut c_void,
+    peb_base_address: *mut c_void,
+    reserved2: [*mut c_void; 2],
+    unique_process_id: *mut c_void,
+    reserved3: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UnicodeString {
+    length: u16,
+    maximum_length: u16,
+    buffer: *mut u16,
+}
+
+#[cfg(target_pointer_width = "64")]
+const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x20;
+#[cfg(target_pointer_width = "32")]
+const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x10;
+#[cfg(target_pointer_width = "64")]
+const PROCESS_PARAMETERS_COMMAND_LINE_OFFSET: usize = 0x70;
+#[cfg(target_pointer_width = "32")]
+const PROCESS_PARAMETERS_COMMAND_LINE_OFFSET: usize = 0x40;
 
 const DSH_PORT: u16 = 3080;
 const RUNTIME_DIRECTORY: &str = "DSH-Runtime";
@@ -585,6 +624,144 @@ fn is_process_running(pid: u32) -> Result<bool, String> {
     Ok(exit_code == PROCESS_STILL_ACTIVE)
 }
 
+fn listening_process_ids(port: u16) -> Result<Vec<u32>, String> {
+    let mut command = hidden_command("netstat.exe");
+    command.args(["-ano", "-p", "tcp"]);
+    let output = run_native_command(&mut command, "读取端口占用")?;
+    let mut process_ids = Vec::new();
+    for line in output.lines() {
+        if let Some(pid) = parse_listening_pid(line, port) {
+            if !process_ids.contains(&pid) {
+                process_ids.push(pid);
+            }
+        }
+    }
+    Ok(process_ids)
+}
+
+fn parse_listening_pid(line: &str, port: u16) -> Option<u32> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if fields.len() < 5
+        || !fields[0].eq_ignore_ascii_case("TCP")
+        || !fields[3].eq_ignore_ascii_case("LISTENING")
+    {
+        return None;
+    }
+    let local_port = fields[1].rsplit(':').next()?.parse::<u16>().ok()?;
+    if local_port != port {
+        return None;
+    }
+    fields.last()?.parse::<u32>().ok().filter(|pid| *pid != 0)
+}
+
+fn process_command_line(pid: u32) -> Result<Option<String>, String> {
+    let handle =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if handle.is_null() {
+        return Err(format!("无法读取 DSH 进程命令行：{}", unsafe {
+            GetLastError()
+        }));
+    }
+    let result = unsafe { read_process_command_line(handle) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    result
+}
+
+unsafe fn read_process_command_line(handle: HANDLE) -> Result<Option<String>, String> {
+    let mut basic_information = std::mem::MaybeUninit::<ProcessBasicInformation>::uninit();
+    let mut return_length = 0;
+    let status = NtQueryInformationProcess(
+        handle,
+        0,
+        basic_information.as_mut_ptr().cast::<c_void>(),
+        std::mem::size_of::<ProcessBasicInformation>() as u32,
+        &mut return_length,
+    );
+    if status != 0 {
+        return Err(format!("无法读取 DSH 进程信息：NTSTATUS 0x{status:08x}"));
+    }
+    let basic_information = basic_information.assume_init();
+    if basic_information.peb_base_address.is_null() {
+        return Ok(None);
+    }
+
+    let parameters_address = (basic_information.peb_base_address as usize
+        + PEB_PROCESS_PARAMETERS_OFFSET) as *const c_void;
+    let parameters: *mut c_void = read_process_value(handle, parameters_address)?;
+    if parameters.is_null() {
+        return Ok(None);
+    }
+
+    let command_line_address =
+        (parameters as usize + PROCESS_PARAMETERS_COMMAND_LINE_OFFSET) as *const c_void;
+    let command_line: UnicodeString = read_process_value(handle, command_line_address)?;
+    if command_line.length == 0 || command_line.buffer.is_null() {
+        return Ok(None);
+    }
+
+    let character_count = usize::from(command_line.length) / std::mem::size_of::<u16>();
+    let mut buffer = vec![0u16; character_count];
+    let mut bytes_read = 0;
+    let result = ReadProcessMemory(
+        handle,
+        command_line.buffer.cast::<c_void>(),
+        buffer.as_mut_ptr().cast::<c_void>(),
+        usize::from(command_line.length),
+        &mut bytes_read,
+    );
+    if result == 0 || bytes_read < usize::from(command_line.length) {
+        return Err(format!("无法读取 DSH 进程命令行内容：{}", GetLastError()));
+    }
+    String::from_utf16(&buffer)
+        .map(Some)
+        .map_err(|error| format!("无法解析 DSH 进程命令行：{error}"))
+}
+
+unsafe fn read_process_value<T: Copy>(handle: HANDLE, address: *const c_void) -> Result<T, String> {
+    let mut value = std::mem::MaybeUninit::<T>::uninit();
+    let mut bytes_read = 0;
+    let result = ReadProcessMemory(
+        handle,
+        address,
+        value.as_mut_ptr().cast::<c_void>(),
+        std::mem::size_of::<T>(),
+        &mut bytes_read,
+    );
+    if result == 0 || bytes_read < std::mem::size_of::<T>() {
+        return Err(format!("无法读取 DSH 进程内存：{}", GetLastError()));
+    }
+    Ok(value.assume_init())
+}
+
+fn is_verified_dsh_command(command_line: &str, port: u16) -> bool {
+    let normalized = command_line.to_ascii_lowercase().replace('\\', "/");
+    if !(normalized.contains("@deepseek-ai/dsh/") && normalized.contains("/lib/bin.js")) {
+        return false;
+    }
+
+    let tokens: Vec<&str> = normalized
+        .split_whitespace()
+        .map(|token| token.trim_matches('"'))
+        .collect();
+    let has_web_command = tokens.contains(&"web");
+    let port_argument = port.to_string();
+    let port_equals_argument = format!("--port={port_argument}");
+    let has_explicit_port_argument = tokens
+        .iter()
+        .any(|token| *token == "--port" || token.starts_with("--port="));
+    let port_matches = if !has_explicit_port_argument {
+        true
+    } else {
+        tokens.iter().any(|token| *token == port_equals_argument)
+            || tokens
+                .windows(2)
+                .any(|window| window[0] == "--port" && window[1] == port_argument)
+    };
+    has_web_command && port_matches
+}
+
 fn attach_parent_console() {
     unsafe {
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
@@ -665,29 +842,43 @@ fn restart_dsh() -> Result<String, String> {
 }
 
 fn stop_dsh() -> Result<String, String> {
-    let Some(process) = read_native_dsh_process()? else {
+    let tracked_process = read_native_dsh_process()?;
+    let mut candidate_pids = listening_process_ids(DSH_PORT)?;
+    if let Some(process) = tracked_process {
+        if is_process_running(process.pid)? && !candidate_pids.contains(&process.pid) {
+            candidate_pids.push(process.pid);
+        }
+    }
+
+    let mut verified_pid = None;
+    for pid in candidate_pids {
+        let Some(command_line) = process_command_line(pid)? else {
+            continue;
+        };
+        if is_verified_dsh_command(&command_line, DSH_PORT) {
+            verified_pid = Some(pid);
+            break;
+        }
+    }
+    let Some(pid) = verified_pid else {
         return if is_dsh_running() {
-            Err("端口 3080 上的服务不是由此程序启动，无法关闭。".to_owned())
+            Err("端口 3080 上的进程无法验证为 DSH，已拒绝关闭。".to_owned())
         } else {
+            clear_native_dsh_pid()?;
             Ok("服务当前未运行".to_owned())
         };
     };
 
-    if !native_dsh_process_matches(process)? {
-        return if is_dsh_running() {
-            Err("端口 3080 上的服务无法确认归属，无法关闭。".to_owned())
-        } else {
-            clear_native_dsh_pid()?;
-            Ok("服务当前未运行".to_owned())
-        };
-    }
-
-    terminate_native_dsh_process(process.pid)?;
+    terminate_native_dsh_process(pid)?;
     let deadline = Instant::now() + DSH_STOP_TIMEOUT;
     while Instant::now() < deadline {
-        if !native_dsh_process_matches(process)? || !is_dsh_running() {
+        let process_running = is_process_running(pid)?;
+        if !process_running && !is_dsh_running() {
             clear_native_dsh_pid()?;
             return Ok("服务已停止".to_owned());
+        }
+        if !process_running && is_dsh_running() {
+            return Err("已关闭已验证的 DSH 进程，但端口 3080 仍被其他进程占用。".to_owned());
         }
         thread::sleep(Duration::from_millis(300));
     }
@@ -2857,6 +3048,58 @@ mod tests {
         assert!(Action::from_name("open").is_some());
         assert!(Action::from_name("web").is_some());
         assert!(Action::from_name("unknown").is_none());
+    }
+
+    #[test]
+    fn dsh_process_ownership_requires_entrypoint_web_and_port() {
+        let command_line = r#""C:\Users\user\AppData\Local\DSH-Runtime\node\node.exe" C:\Users\user\AppData\Local\npm-global\node_modules\@deepseek-ai\dsh\lib\bin.js web --no-open --host 127.0.0.1 --port 3080"#;
+        assert!(is_verified_dsh_command(command_line, 3080));
+        assert!(!is_verified_dsh_command(command_line, 3081));
+        assert!(is_verified_dsh_command(
+            r#"node.exe C:\pkg\@deepseek-ai\dsh\lib\bin.js web"#,
+            3080
+        ));
+        assert!(!is_verified_dsh_command(
+            r#""C:\Program Files\other\server.exe" web --port 3080"#,
+            3080
+        ));
+        assert!(!is_verified_dsh_command(
+            r#"node.exe C:\pkg\@deepseek-ai\dsh\lib\bin.js --port 3080"#,
+            3080
+        ));
+    }
+
+    #[test]
+    fn native_process_command_line_reader_handles_current_process() {
+        let command_line = process_command_line(std::process::id())
+            .expect("current process command line should be readable")
+            .expect("current process should have a command line");
+        assert!(!command_line.trim().is_empty());
+    }
+
+    #[test]
+    fn netstat_parser_only_returns_listening_pid_for_requested_port() {
+        assert_eq!(
+            parse_listening_pid(
+                "  TCP    127.0.0.1:3080    0.0.0.0:0    LISTENING    1404",
+                3080
+            ),
+            Some(1404)
+        );
+        assert_eq!(
+            parse_listening_pid(
+                "  TCP    127.0.0.1:3081    0.0.0.0:0    LISTENING    1404",
+                3080
+            ),
+            None
+        );
+        assert_eq!(
+            parse_listening_pid(
+                "  TCP    127.0.0.1:3080    0.0.0.0:0    ESTABLISHED    1404",
+                3080
+            ),
+            None
+        );
     }
 
     #[test]
