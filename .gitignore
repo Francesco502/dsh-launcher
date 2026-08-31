@@ -1,4 +1,8 @@
 /target/
+/target-0.2.0/
+/dist/
+/dist-*/
+/.tmp-*/
 *.exe
 *.pdb
 *.log

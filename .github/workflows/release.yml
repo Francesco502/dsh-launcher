@@ -14,18 +14,30 @@ permissions:
 
 jobs:
   release:
-    runs-on: windows-latest
-    timeout-minutes: 20
+    runs-on: windows-2022
+    timeout-minutes: 45
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-gnu
+      - name: Configure bundled MinGW linker
+        shell: pwsh
+        run: |
+          $mingwBin = "C:\msys64\mingw64\bin"
+          $gcc = Join-Path $mingwBin "x86_64-w64-mingw32-gcc.exe"
+          if (-not (Test-Path -LiteralPath $gcc -PathType Leaf)) {
+            throw "The pinned Windows runner does not contain the required MinGW x64 linker: $gcc"
+          }
+          $mingwBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $gcc --version
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --target x86_64-pc-windows-gnu
+          rustup run 1.97.0 rustc --version
 
       - name: Validate release metadata
         shell: pwsh
@@ -36,7 +48,10 @@ jobs:
         run: cargo fmt --check --all
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --target x86_64-pc-windows-gnu
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
       - name: Build Windows release
         run: cargo build --locked --release --target x86_64-pc-windows-gnu --bins
@@ -47,6 +62,29 @@ jobs:
           $releaseDir = "target\x86_64-pc-windows-gnu\release"
           & "$releaseDir\embed_icon.exe" "$releaseDir\dsh-launcher.exe"
 
+      - name: Prepare portable Windows bundle
+        shell: pwsh
+        run: |
+          & .github\scripts\prepare-portable.ps1 `
+            -LauncherPath "target\x86_64-pc-windows-gnu\release\dsh-launcher.exe" `
+            -OutputZip "dist\DSH-Launcher-Portable-x64.zip"
+
+      - name: Smoke test extracted lightweight bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $smokeRoot = Join-Path $env:RUNNER_TEMP "dsh-launcher-offline-smoke-$PID"
+          if (Test-Path -LiteralPath $smokeRoot) {
+            Remove-Item -LiteralPath $smokeRoot -Recurse -Force
+          }
+          Expand-Archive -LiteralPath "dist\DSH-Launcher-Portable-x64.zip" -DestinationPath $smokeRoot -Force
+          $control = Join-Path $smokeRoot "DSH-Launcher-Portable-x64\dshctl.cmd"
+          & $control stop
+          if ($LASTEXITCODE -ne 0) {
+            throw "Extracted portable bundle command-line smoke test failed with exit code $LASTEXITCODE."
+          }
+          Remove-Item -LiteralPath $smokeRoot -Recurse -Force
+
       - name: Prepare update assets
         shell: pwsh
         run: |
@@ -56,11 +94,26 @@ jobs:
           New-Item -ItemType Directory -Path $distDir -Force | Out-Null
           $exePath = Join-Path $distDir "DSH-Launcher.exe"
           $checksumPath = Join-Path $distDir "DSH-Launcher.exe.sha256"
+          $portablePath = Join-Path $distDir "DSH-Launcher-Portable-x64.zip"
+          $portableChecksumPath = Join-Path $distDir "DSH-Launcher-Portable-x64.zip.sha256"
           $manifestPath = Join-Path $distDir "release-manifest.json"
+          $sbomPath = Join-Path $distDir "sbom.spdx.json"
           Copy-Item -LiteralPath "$releaseDir\dsh-launcher.exe" -Destination $exePath -Force
           $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exePath).Hash.ToLowerInvariant()
           "$exeHash  DSH-Launcher.exe" | Set-Content -LiteralPath $checksumPath -Encoding ascii -NoNewline
           $checksumHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $checksumPath).Hash.ToLowerInvariant()
+          if (-not (Test-Path -LiteralPath $portablePath -PathType Leaf)) {
+            throw "Portable bundle was not produced."
+          }
+          $portableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $portablePath).Hash.ToLowerInvariant()
+          "$portableHash  DSH-Launcher-Portable-x64.zip" | Set-Content -LiteralPath $portableChecksumPath -Encoding ascii -NoNewline
+          $portableChecksumHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $portableChecksumPath).Hash.ToLowerInvariant()
+          & .github\scripts\prepare-sbom.ps1 -OutputPath $sbomPath
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $sbomPath -PathType Leaf)) {
+            throw "SBOM generation failed."
+          }
+          $sbomHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sbomPath).Hash.ToLowerInvariant()
+          $runtimeManifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath "runtime-manifest.json").Hash.ToLowerInvariant()
           $tagVersion = $env:GITHUB_REF_NAME.Substring(1)
           $manifest = [ordered]@{
             schema_version = 1
@@ -69,6 +122,11 @@ jobs:
             tag = $env:GITHUB_REF_NAME
             commit = $env:GITHUB_SHA
             target = "x86_64-pc-windows-gnu"
+            architecture = "x86_64"
+            authenticode_status = "unsigned"
+            runtime_manifest_sha256 = $runtimeManifestHash
+            dependency_lock_sha256 = "not_applicable"
+            manifest_self_hash = "excluded_to_avoid_self_reference"
             assets = @(
               [ordered]@{
                 name = "DSH-Launcher.exe"
@@ -80,14 +138,37 @@ jobs:
                 sha256 = $checksumHash
                 type = "text/plain"
               }
+              [ordered]@{
+                name = "DSH-Launcher-Portable-x64.zip"
+                sha256 = $portableHash
+                type = "application/zip"
+              }
+              [ordered]@{
+                name = "DSH-Launcher-Portable-x64.zip.sha256"
+                sha256 = $portableChecksumHash
+                type = "text/plain"
+              }
+              [ordered]@{
+                name = "sbom.spdx.json"
+                sha256 = $sbomHash
+                type = "application/spdx+json"
+              }
             )
           }
           $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $manifestPath -Encoding utf8
           $actualAssetNames = @(Get-ChildItem -LiteralPath $distDir -File | Select-Object -ExpandProperty Name | Sort-Object)
-          $expectedAssetNames = @("DSH-Launcher.exe", "DSH-Launcher.exe.sha256", "release-manifest.json") | Sort-Object
+          $expectedAssetNames = @(
+            "DSH-Launcher.exe",
+            "DSH-Launcher.exe.sha256",
+            "DSH-Launcher-Portable-x64.zip",
+            "DSH-Launcher-Portable-x64.zip.sha256",
+            "release-manifest.json",
+            "sbom.spdx.json"
+          ) | Sort-Object
           if (($actualAssetNames -join "|") -ne ($expectedAssetNames -join "|")) {
-            throw "Release asset set is not exactly the required three files: $($actualAssetNames -join ', ')"
+            throw "Release asset set is not exactly the required six files: $($actualAssetNames -join ', ')"
           }
+          & .github\scripts\validate-release.ps1 -Tag $env:GITHUB_REF_NAME -ReleaseDirectory $distDir
 
       - name: Publish GitHub Release
         shell: pwsh
@@ -106,18 +187,65 @@ jobs:
           $releaseBody = @{
             tag_name = $env:GITHUB_REF_NAME
             name = $env:GITHUB_REF_NAME
-            generate_release_notes = $true
+            target_commitish = $env:GITHUB_SHA
+            draft = $true
+            prerelease = $false
+            generate_release_notes = $false
+            body = "DSH Launcher $env:GITHUB_REF_NAME. This Windows x64 release is unsigned (authenticode_status: unsigned). DSH-Launcher-Portable-x64.zip is the lightweight launcher package; the first runtime repair requires network access to download and verify Node.js and DSH. DSH-Launcher.exe is the technical self-update asset."
           } | ConvertTo-Json
           $release = Invoke-RestMethod -Method Post -Uri $releaseApi -Headers $headers -ContentType "application/json" -Body $releaseBody
           $uploadApi = $release.upload_url.Split('{')[0]
 
-          foreach ($assetPath in (Get-ChildItem -LiteralPath $distDir -File)) {
-            $assetName = $assetPath.Name
+          $assetNames = @(
+            "DSH-Launcher.exe",
+            "DSH-Launcher.exe.sha256",
+            "DSH-Launcher-Portable-x64.zip",
+            "DSH-Launcher-Portable-x64.zip.sha256",
+            "release-manifest.json",
+            "sbom.spdx.json"
+          )
+          foreach ($assetName in $assetNames) {
+            $assetPath = Get-Item -LiteralPath (Join-Path $distDir $assetName)
             $assetUrl = "$uploadApi`?name=$([uri]::EscapeDataString($assetName))"
             $contentType = switch -Wildcard ($assetName) {
               "*.exe" { "application/vnd.microsoft.portable-executable"; break }
+              "*.zip" { "application/zip"; break }
+              "sbom.spdx.json" { "application/spdx+json"; break }
               "*.json" { "application/json"; break }
               default { "text/plain" }
             }
             Invoke-RestMethod -Method Post -Uri $assetUrl -Headers $headers -ContentType $contentType -InFile $assetPath.FullName | Out-Null
+          }
+
+          $release = Invoke-RestMethod -Method Get -Uri "$releaseApi/$($release.id)" -Headers $headers
+          foreach ($assetName in $assetNames) {
+            $remote = @($release.assets | Where-Object { $_.name -eq $assetName }) | Select-Object -First 1
+            if ($null -eq $remote) {
+              throw "GitHub draft Release is missing uploaded asset: $assetName"
+            }
+            $downloadPath = Join-Path $env:RUNNER_TEMP "downloaded-$PID-$assetName"
+            if (Test-Path -LiteralPath $downloadPath) {
+              Remove-Item -LiteralPath $downloadPath -Force
+            }
+            Invoke-WebRequest -UseBasicParsing -Uri $remote.browser_download_url -Headers $headers -OutFile $downloadPath
+            $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $distDir $assetName)).Hash.ToLowerInvariant()
+            $downloadedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $downloadPath).Hash.ToLowerInvariant()
+            Remove-Item -LiteralPath $downloadPath -Force
+            if ($localHash -ne $downloadedHash) {
+              throw "Downloaded GitHub asset hash mismatch: $assetName"
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$remote.digest) -and
+                [string]$remote.digest -ne "sha256:$localHash") {
+              throw "GitHub server digest mismatch: $assetName"
+            }
+          }
+
+          $publishBody = @{ draft = $false } | ConvertTo-Json
+          $published = Invoke-RestMethod -Method Patch -Uri "$releaseApi/$($release.id)" -Headers $headers -ContentType "application/json" -Body $publishBody
+          if ($published.draft) {
+            throw "GitHub Release remained a draft after finalization."
+          }
+          $remoteNames = @($published.assets | Select-Object -ExpandProperty name | Sort-Object)
+          if (($remoteNames -join "|") -ne (($assetNames | Sort-Object) -join "|")) {
+            throw "Published GitHub Release asset set is incomplete."
           }

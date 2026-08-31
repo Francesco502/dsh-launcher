@@ -44,9 +44,10 @@ cargo metadata --locked --no-deps --format-version 1
 1. 工作区干净，代码已提交到 `main`。
 2. `Cargo.toml`、`Cargo.lock`、`CHANGELOG.md` 和标签版本一致。
 3. `cargo fmt --check --all` 通过。
-4. `cargo test --locked` 通过。
-5. Windows GNU release build 通过，且 `embed_icon.exe` 已把彩色和灰度图标写入最终 EXE。
-6. `.github\scripts\validate-release.ps1 -Tag vX.Y.Z` 通过。
+4. `cargo test --locked` 和 `cargo clippy --locked --all-targets -- -D warnings` 通过。
+5. Windows GNU release build 通过，`embed_icon.exe` 已把官方蓝色和黑色鲸鱼图标写入最终 EXE。
+6. 轻量主 ZIP 通过顶层目录、`portable.flag`、无用户数据/凭据、SHA-256 和 SPDX SBOM 检查；主 ZIP 不得包含运行时目录，首次运行由用户在线执行运行时修复。
+7. `.github\scripts\validate-release.ps1 -Tag vX.Y.Z -ReleaseDirectory dist` 通过。
 
 发布门禁由 `.github/workflows/release.yml` 在 GitHub Actions 上重复执行；本地通过不能替代远程构建结果。
 
@@ -66,21 +67,27 @@ cargo metadata --locked --no-deps --format-version 1
    git push origin vX.Y.Z
    ```
 
-7. 标签推送触发 `.github/workflows/release.yml`。工作流会重新验证版本、测试、构建、嵌入图标、生成资产和公开 GitHub Release。
-8. 发布后检查 Release 为非草稿状态，资产名称完整，`release-manifest.json` 中的提交、版本和 SHA-256 与本次构建相符。
-9. 下载 `DSH-Launcher.exe` 并按 `.sha256` 校验；自更新功能只能使用官方仓库 Release 的固定资产。
+7. 标签推送触发 `.github/workflows/release.yml`。工作流会重新验证版本、测试、构建、嵌入图标、生成资产和 SPDX SBOM。
+8. 工作流先创建草稿 Release，上传六个公开资产，重新下载并校验每个资产的哈希和 ZIP 内容，随后才把草稿转为公开状态；任一步失败都不会公开。
+9. 发布后检查 Release 为非草稿状态，资产名称完整，manifest 中的提交、版本、运行时清单摘要、依赖锁摘要和 SHA-256 与本次构建相符。
+10. 下载 `DSH-Launcher.exe` 并按 `.sha256` 校验；自更新功能只能使用官方仓库 Release 的固定技术资产。
 
 工作流失败时，不得跳过门禁手工上传未知构建物。修复后应使用新的 PATCH 版本；已经创建的标签或 Release 不得复用。
 
 ## 6. Release 资产契约
 
-每个稳定版 Release 必须发布以下三个固定名称的资产：
+每个稳定版 Release 必须发布以下六个固定名称的资产：
 
 | 资产 | 用途 |
 | --- | --- |
 | `DSH-Launcher.exe` | 面向 Windows x86_64 GNU 目标的最终启动器，已嵌入图标 |
 | `DSH-Launcher.exe.sha256` | 启动器 EXE 的 SHA-256，格式为 `<hash>  DSH-Launcher.exe` |
+| `DSH-Launcher-Portable-x64.zip` | 轻量 Windows x64 主便携包，仅包含启动器、发布契约和 `portable.flag` |
+| `DSH-Launcher-Portable-x64.zip.sha256` | 便携包 ZIP 的 SHA-256 |
 | `release-manifest.json` | 机器可读的版本、提交、目标平台和资产校验信息 |
+| `sbom.spdx.json` | SPDX 2.3 的 Rust 与按需下载运行时依赖清单 |
+
+Release manifest 必须包含 `authenticode_status: "unsigned"`。`release-manifest.json` 本身不放入自己的 `assets` 哈希数组，因为这样会形成自引用；其余五个资产必须逐一列出并校验。正式 Release 的 `commit` 必须是标签提交的 40 位 SHA；未提交工作树只能在本地显式验证模式下使用 `local-working-tree` 占位值。
 
 `release-manifest.json` 的当前 schema 为 `1`，至少包含：
 
@@ -92,9 +99,16 @@ cargo metadata --locked --no-deps --format-version 1
   "tag": "vX.Y.Z",
   "commit": "<github-sha>",
   "target": "x86_64-pc-windows-gnu",
+  "architecture": "x86_64",
+  "authenticode_status": "unsigned",
+  "runtime_manifest_sha256": "<runtime-manifest-hash>",
+  "dependency_lock_sha256": "not_applicable",
   "assets": [
     { "name": "DSH-Launcher.exe", "sha256": "<hash>", "type": "application/vnd.microsoft.portable-executable" },
-    { "name": "DSH-Launcher.exe.sha256", "sha256": "<hash>", "type": "text/plain" }
+    { "name": "DSH-Launcher.exe.sha256", "sha256": "<hash>", "type": "text/plain" },
+    { "name": "DSH-Launcher-Portable-x64.zip", "sha256": "<hash>", "type": "application/zip" },
+    { "name": "DSH-Launcher-Portable-x64.zip.sha256", "sha256": "<hash>", "type": "text/plain" },
+    { "name": "sbom.spdx.json", "sha256": "<hash>", "type": "application/spdx+json" }
   ]
 }
 ```
