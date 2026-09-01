@@ -61,14 +61,27 @@ jobs:
       - name: Build GNU release
         run: cargo build --locked --release --target x86_64-pc-windows-gnu --bins
 
-      - name: Embed icons and smoke portable bundle
+      - name: Embed application icons
         shell: pwsh
         run: |
           $releaseDir = "target\x86_64-pc-windows-gnu\release"
           & "$releaseDir\embed_icon.exe" "$releaseDir\dsh-launcher.exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Icon embedding failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Prepare portable bundle
+        shell: pwsh
+        run: |
+          $releaseDir = "target\x86_64-pc-windows-gnu\release"
           & .github\scripts\prepare-portable.ps1 `
             -LauncherPath "$releaseDir\dsh-launcher.exe" `
             -OutputZip "dist\DSH-Launcher-Portable-x64.zip"
+
+      - name: Smoke test portable bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
           $smokeRoot = Join-Path $env:USERPROFILE "dsh-launcher-ci-smoke-$PID"
           Expand-Archive -LiteralPath "dist\DSH-Launcher-Portable-x64.zip" -DestinationPath $smokeRoot -Force
           $control = Join-Path $smokeRoot "DSH-Launcher-Portable-x64\dshctl.cmd"
