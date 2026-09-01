@@ -77,7 +77,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $smokeRoot = Join-Path $env:RUNNER_TEMP "dsh-launcher-offline-smoke-$PID"
+          $smokeBase = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+          $smokeRoot = [IO.Path]::GetFullPath((Join-Path $smokeBase "dsh-launcher-offline-smoke-$PID"))
+          if (-not $smokeRoot.StartsWith("$smokeBase\", [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Smoke test directory escaped the runner profile: $smokeRoot"
+          }
           if (Test-Path -LiteralPath $smokeRoot) {
             Remove-Item -LiteralPath $smokeRoot -Recurse -Force
           }
