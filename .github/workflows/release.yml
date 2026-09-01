@@ -202,6 +202,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
+          $ErrorActionPreference = "Stop"
+          trap {
+            $summary = $_.Exception.Message.Replace("`r", " ").Replace("`n", " ")
+            Write-Output "::error title=Publish GitHub Release failed::$summary"
+            exit 1
+          }
           $repository = "Francesco502/dsh-launcher"
           $distDir = Join-Path $PWD "dist"
           $headers = @{
@@ -211,7 +217,7 @@ jobs:
             "User-Agent" = "DSH-Launcher-Release"
           }
           $releaseApi = "https://api.github.com/repos/$repository/releases"
-          $releaseBody = @{
+          $releaseMetadata = @{
             tag_name = $env:GITHUB_REF_NAME
             name = $env:GITHUB_REF_NAME
             target_commitish = $env:GITHUB_SHA
@@ -219,8 +225,27 @@ jobs:
             prerelease = $false
             generate_release_notes = $false
             body = "DSH Launcher $env:GITHUB_REF_NAME. This Windows x64 release is unsigned (authenticode_status: unsigned). DSH-Launcher-Portable-x64.zip is the lightweight launcher package; the first runtime repair requires network access to download and verify Node.js and DSH. DSH-Launcher.exe is the technical self-update asset."
-          } | ConvertTo-Json
-          $release = Invoke-RestMethod -Method Post -Uri $releaseApi -Headers $headers -ContentType "application/json" -Body $releaseBody
+          }
+          $existing = @(
+            Invoke-RestMethod -Method Get -Uri "${releaseApi}?per_page=100" -Headers $headers |
+              Where-Object { $_.tag_name -eq $env:GITHUB_REF_NAME }
+          )
+          if ($existing.Count -gt 1) {
+            throw "More than one GitHub Release exists for $env:GITHUB_REF_NAME."
+          }
+          if ($existing.Count -eq 1) {
+            $release = $existing[0]
+            if (-not $release.draft) {
+              throw "A published GitHub Release already exists for $env:GITHUB_REF_NAME."
+            }
+            $release = Invoke-RestMethod -Method Patch -Uri "$releaseApi/$($release.id)" -Headers $headers -ContentType "application/json" -Body ($releaseMetadata | ConvertTo-Json)
+            foreach ($staleAsset in @($release.assets)) {
+              Invoke-RestMethod -Method Delete -Uri "$releaseApi/assets/$($staleAsset.id)" -Headers $headers | Out-Null
+            }
+            $release = Invoke-RestMethod -Method Get -Uri "$releaseApi/$($release.id)" -Headers $headers
+          } else {
+            $release = Invoke-RestMethod -Method Post -Uri $releaseApi -Headers $headers -ContentType "application/json" -Body ($releaseMetadata | ConvertTo-Json)
+          }
           $uploadApi = $release.upload_url.Split('{')[0]
 
           $assetNames = @(
@@ -254,7 +279,9 @@ jobs:
             if (Test-Path -LiteralPath $downloadPath) {
               Remove-Item -LiteralPath $downloadPath -Force
             }
-            Invoke-WebRequest -UseBasicParsing -Uri $remote.browser_download_url -Headers $headers -OutFile $downloadPath
+            $downloadHeaders = $headers.Clone()
+            $downloadHeaders.Accept = "application/octet-stream"
+            Invoke-WebRequest -UseBasicParsing -Uri $remote.url -Headers $downloadHeaders -OutFile $downloadPath
             $localHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $distDir $assetName)).Hash.ToLowerInvariant()
             $downloadedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $downloadPath).Hash.ToLowerInvariant()
             Remove-Item -LiteralPath $downloadPath -Force
