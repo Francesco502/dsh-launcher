@@ -21,11 +21,13 @@ jobs:
       - name: Configure bundled MinGW linker
         shell: pwsh
         run: |
-          $mingwBin = "C:\msys64\mingw64\bin"
-          $gcc = Join-Path $mingwBin "x86_64-w64-mingw32-gcc.exe"
-          if (-not (Test-Path -LiteralPath $gcc -PathType Leaf)) {
-            throw "The pinned Windows runner does not contain the required MinGW x64 linker: $gcc"
+          $mingwBin = @("C:\mingw64\bin", "C:\msys64\mingw64\bin") |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_ "gcc.exe") -PathType Leaf } |
+            Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($mingwBin)) {
+            throw "The pinned Windows runner does not contain a supported MinGW x64 gcc.exe."
           }
+          $gcc = Join-Path $mingwBin "gcc.exe"
           $mingwBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & $gcc --version
 
