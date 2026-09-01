@@ -1,5 +1,5 @@
 /target/
-/target-0.2.0/
+/target-*/
 /dist/
 /dist-*/
 /.tmp-*/

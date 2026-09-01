@@ -1,14 +1,14 @@
-# DSH Launcher
+# DSH启动器
 
-`dsh-launcher.exe` 是面向 Windows 的原生 DSH 服务控制器。
+`dsh-launcher.exe` 是面向 Windows 的原生“DSH启动器”。
 
 当前应用版本以 `Cargo.toml` 的 `[package].version` 为唯一来源；版本和发布规则见 [`VERSIONING.md`](VERSIONING.md)，变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
 
-This project targets local DSH lifecycle management: install/update, start, restart, stop, and open the Web UI. Version 0.2.0 ships as a lightweight Windows x64 portable launcher for Windows 10/11; the runtime is installed on demand when the user chooses `验证并修复运行时`.
+This project targets local DSH lifecycle management: install/update, start, restart, stop, and open the Web UI. Version 0.2.1 ships as a lightweight Windows x64 portable launcher for Windows 10/11; the runtime is installed on demand when the user chooses `验证并修复运行时`.
 
 ## Main window
 
-Launching the executable opens a visible `DSH 控制中心` window with these actions:
+Launching the executable opens a visible `DSH启动器` window with these actions:
 
 - 启动 dsh
 - 重启 dsh
@@ -29,7 +29,7 @@ The `DSH-Launcher-Portable-x64.zip` deliberately contains no Node.js, PowerShell
 
 The launcher can stop a DSH service started by the launcher or by another local method only after verifying that the `3080` listener's command line contains the DSH package entry point and the `web` command. An explicit `--port` argument must match `3080`; omitting it is accepted because the verified process is the listener on `3080`. It refuses to terminate an unverified process. If port `3080` is occupied by another service, release it before starting the Windows-native service. The GUI can offer a transactional copy of old `%LOCALAPPDATA%\DSH-Runtime`, `%LOCALAPPDATA%\npm-global`, and `%USERPROFILE%\.dsh` data; each file is checked by size and SHA-256, failures roll back the target, and the old source is never auto-deleted.
 
-DSH stdout and stderr are retained in `<data-root>\logs\dsh-launcher-native.out.log` and `dsh-launcher-native.err.log`; logs rotate by type at five files of 5 MiB each. A launch failure reports the stage, log path, and final diagnostic lines. The upgrade action compares full SemVer and refuses downgrade, installs the exact candidate with a lockfile, blocks high/critical npm audit findings, starts it on port `3081`, and checks both the Web UI and `dsh-quota` JSON endpoint. Only that already-verified directory replaces the data-root package. A failed promotion or restart restores the prior version and, when needed, restarts the prior service.
+DSH stdout and stderr are retained in `<data-root>\logs\dsh-launcher-native.out.log` and `dsh-launcher-native.err.log`; logs rotate by type at five files of 5 MiB each. A launch failure reports the stage, log path, and final diagnostic lines. The upgrade action compares every version published in the official npm package metadata using full SemVer, including prereleases not assigned to the `latest` dist-tag, and refuses downgrade. It installs the exact candidate with a lockfile, blocks high/critical npm audit findings, starts it on port `3081`, and checks both the Web UI and `dsh-quota` JSON endpoint. Only that already-verified directory replaces the data-root package. A failed promotion or restart restores the prior version and, when needed, restarts the prior service.
 
 ## Build
 

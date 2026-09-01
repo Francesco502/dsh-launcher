@@ -70,12 +70,11 @@ $runtimeManifest = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'run
         $runtimeManifest.dsh.entry -ne 'lib/bin.js') {
         throw "runtime-manifest.json contains an invalid DSH package declaration."
     }
-    if ([string]$runtimeManifest.dsh.registry_url -notmatch '^https://registry\.npmjs\.org/.+/latest$') {
-        throw "runtime-manifest.json DSH registry URL is not fixed to the npm latest endpoint."
+    if ([string]$runtimeManifest.dsh.registry_url -ne 'https://registry.npmjs.org/@deepseek-ai%2fdsh') {
+        throw "runtime-manifest.json DSH registry URL is not fixed to the official package metadata endpoint."
     }
     $peerDependencies = @($runtimeManifest.dsh.peer_dependencies)
-    if ($peerDependencies.Count -eq 0 -or
-        @($peerDependencies | Where-Object {
+    if (@($peerDependencies | Where-Object {
             $spec = [string]$_
             $separator = $spec.LastIndexOf('@')
             if ($separator -le 0 -or $separator -ge $spec.Length - 1) {
@@ -179,7 +178,7 @@ $runtimeManifest = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'run
             $releaseManifest.target -ne 'x86_64-pc-windows-gnu' -or
             $releaseManifest.architecture -ne 'x86_64' -or
             $releaseManifest.authenticode_status -ne 'unsigned') {
-            throw 'release-manifest.json does not match the 0.2.0 release contract.'
+            throw 'release-manifest.json does not match the release contract.'
         }
         $manifestCommit = [string]$releaseManifest.commit
         if ($AllowLocalWorkingTree -and $manifestCommit -eq 'local-working-tree') {

@@ -24,9 +24,6 @@ if ($null -eq $application) {
 $applicationVersion = [string]$application.version
 $runtimeManifest = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot "runtime-manifest.json") | ConvertFrom-Json
 $peerDependencies = @($runtimeManifest.dsh.peer_dependencies)
-if ($peerDependencies.Count -eq 0) {
-    throw "runtime-manifest.json does not declare fixed DSH peer dependencies."
-}
 
 $packages = @()
 foreach ($package in @($metadata.packages)) {

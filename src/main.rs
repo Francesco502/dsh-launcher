@@ -67,10 +67,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, IsWindowEnabled, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 use windows_sys::Win32::UI::Shell::{
-    IsUserAnAdmin, SHFileOperationW, Shell_NotifyIconW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
-    FOF_NOERRORUI, FO_DELETE, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW,
-    NOTIFYICON_VERSION_4, SHFILEOPSTRUCTW,
+    IsUserAnAdmin, SHFileOperationW, SetCurrentProcessExplicitAppUserModelID, Shell_NotifyIconW,
+    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FO_DELETE, NIF_ICON, NIF_INFO, NIF_MESSAGE,
+    NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT,
+    NOTIFYICONDATAW, NOTIFYICON_VERSION_4, SHFILEOPSTRUCTW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateAcceleratorTableW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
@@ -82,13 +82,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TrackPopupMenu,
     TranslateAcceleratorW, TranslateMessage, WindowFromPoint, ACCEL, BM_CLICK, BS_OWNERDRAW,
     CREATESTRUCTW, DI_NORMAL, EVENT_OBJECT_NAMECHANGE, FVIRTKEY, GWLP_USERDATA, HICON, ICON_BIG,
-    ICON_SMALL, IDC_ARROW, IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, OBJID_CLIENT, SM_CXSCREEN, SM_CYSCREEN, SPI_GETHIGHCONTRAST,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
-    TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETICON,
-    WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
+    ICON_SMALL, ICON_SMALL2, IDC_ARROW, IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, OBJID_CLIENT, SM_CXSCREEN, SM_CYSCREEN,
+    SPI_GETHIGHCONTRAST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE,
+    SW_SHOW, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
+    WM_SETICON, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
     WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_EX_TRANSPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED,
     WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
@@ -169,8 +169,9 @@ const UPGRADE_PREFLIGHT_PORT: u16 = 3081;
 const PROCESS_STILL_ACTIVE: u32 = 259;
 const WEB_URL: &str = "http://127.0.0.1:3080/";
 const QUOTA_CONFIG_PATH: &str = "/api/dsh-quota/config";
-const DSH_LATEST_VERSION_SCRIPT: &str = "fetch(process.argv[1],{signal:AbortSignal.timeout(10000)}).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(p=>console.log(p.version)).catch(e=>{console.error(e.message);process.exit(1)})";
+const DSH_LATEST_VERSION_SCRIPT: &str = "fetch(process.argv[1],{signal:AbortSignal.timeout(10000)}).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}).then(p=>console.log(JSON.stringify(Object.keys(p.versions||{})))).catch(e=>{console.error(e.message);process.exit(1)})";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const APP_USER_MODEL_ID: &str = "DeepSeek.DSHLauncher";
 const LAUNCHER_RELEASE_API_URL: &str =
     "https://api.github.com/repos/Francesco502/dsh-launcher/releases/latest";
 const LAUNCHER_ASSET_NAME: &str = "DSH-Launcher.exe";
@@ -218,7 +219,6 @@ const CMD_MIGRATE_LEGACY: u32 = 1014;
 const CMD_MORE_TOOLS: u32 = 1015;
 const CMD_HOME: u32 = 1016;
 const ID_TITLE: u32 = 1101;
-const ID_SUBTITLE: u32 = 1102;
 const ID_STATUS: u32 = 1103;
 const ID_SECTION: u32 = 1104;
 const ID_FOOTER: u32 = 1105;
@@ -231,7 +231,7 @@ const HEALTH_TIMER_INTERVAL_MS: u32 = 5000;
 const HOVER_STEPS: usize = 4;
 const HOVER_BUTTON_COUNT: usize = 13;
 const WINDOW_CLASS: &str = "DeepSeekHarnessDshControlWindow";
-const WINDOW_TITLE: &str = "DSH 服务管理";
+const WINDOW_TITLE: &str = "DSH启动器";
 const UI_FONT_FAMILY: &str = "Microsoft YaHei UI";
 const ICON_RESOURCE_ID: usize = 1;
 const BLACK_ICON_RESOURCE_ID: usize = 2;
@@ -670,7 +670,7 @@ fn run_release_smoke() -> Result<String, String> {
         .ok_or_else(|| "无法定位启动器目录".to_owned())?;
     verify_portable_manifest(executable_dir)?;
     paths.ensure_layout()?;
-    Ok(format!("DSH Launcher v{APP_VERSION} 便携包初始化检查通过"))
+    Ok(format!("DSH启动器 v{APP_VERSION} 便携包初始化检查通过"))
 }
 
 fn parse_self_update(args: &[String]) -> Option<PathBuf> {
@@ -1738,7 +1738,7 @@ unsafe fn write_cli_bytes(handle: HANDLE, bytes: &[u8]) -> bool {
 fn ensure_not_elevated() -> Result<(), String> {
     if unsafe { IsUserAnAdmin() } != 0 {
         Err(
-            "请不要以管理员身份运行 DSH 启动器；它必须使用当前 Windows 用户的 .dsh 配置与插件。"
+            "请不要以管理员身份运行 DSH启动器；它必须使用当前 Windows 用户的 .dsh 配置与插件。"
                 .to_owned(),
         )
     } else {
@@ -2976,24 +2976,24 @@ fn latest_dsh_version_from_registry() -> Result<String, String> {
     configure_native_environment(&mut command)?;
     command.args(["-e", DSH_LATEST_VERSION_SCRIPT, &registry_url]);
     let output = run_native_command(&mut command, "查询最新版本")?;
-    parse_dsh_version(&output).ok_or_else(|| "最新版本查询未返回有效版本号".to_owned())
+    parse_latest_dsh_version(&output).ok_or_else(|| "最新版本查询未返回有效版本号".to_owned())
 }
 
 fn latest_dsh_version_from_npm() -> Result<String, String> {
     let package_name = runtime_manifest()?.dsh_package;
-    let package = format!("{package_name}@latest");
     let mut command = native_npm_command()?;
     command.args([
         "view",
-        &package,
-        "version",
+        &package_name,
+        "versions",
+        "--json",
         "--fetch-timeout=10000",
         "--fetch-retries=0",
         "--loglevel=error",
         &format!("--registry={}", npm_registry_base_url()?),
     ]);
     let output = run_native_command(&mut command, "查询最新版本")?;
-    parse_dsh_version(&output).ok_or_else(|| "最新版本查询未返回有效版本号".to_owned())
+    parse_latest_dsh_version(&output).ok_or_else(|| "最新版本查询未返回有效版本号".to_owned())
 }
 
 fn native_dsh_version_for_entry(entry: &Path) -> Result<String, String> {
@@ -3007,13 +3007,20 @@ fn native_dsh_version_for_entry(entry: &Path) -> Result<String, String> {
     parse_package_version(&contents).ok_or_else(|| "DSH 未返回版本号".to_owned())
 }
 
-fn parse_dsh_version(output: &str) -> Option<String> {
-    output
-        .lines()
-        .map(str::trim)
-        .rev()
-        .find(|line| is_safe_dsh_version(line))
-        .map(str::to_owned)
+fn parse_latest_dsh_version(output: &str) -> Option<String> {
+    let versions = serde_json::from_str::<Vec<String>>(output.trim()).unwrap_or_else(|_| {
+        output
+            .lines()
+            .map(str::trim)
+            .filter(|line| is_safe_dsh_version(line))
+            .map(str::to_owned)
+            .collect()
+    });
+    versions
+        .into_iter()
+        .filter_map(|version| parse_dsh_semver(&version).map(|parsed| (parsed, version)))
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, version)| version)
 }
 
 fn parse_dsh_semver(value: &str) -> Option<DshVersion> {
@@ -3491,12 +3498,8 @@ fn parse_runtime_manifest(value: &str) -> Result<RuntimeManifest, String> {
         || !is_safe_dsh_version(&manifest.node_version)
         || !is_safe_dsh_version(&manifest.dsh_bootstrap_version)
         || manifest.dsh_package != "@deepseek-ai/dsh"
-        || !manifest
-            .dsh_registry_url
-            .starts_with("https://registry.npmjs.org/")
-        || !manifest.dsh_registry_url.ends_with("/latest")
+        || manifest.dsh_registry_url != "https://registry.npmjs.org/@deepseek-ai%2fdsh"
         || manifest.dsh_entry != "lib/bin.js"
-        || manifest.dsh_peer_dependencies.is_empty()
         || manifest.dsh_peer_dependencies.iter().any(|spec| {
             let Some((package, version)) = spec.rsplit_once('@') else {
                 return true;
@@ -3594,7 +3597,7 @@ fn resolve_data_root(
         let expected = fs::canonicalize(&colocated).unwrap_or(colocated.clone());
         if requested != expected {
             return Err(format!(
-                "0.2.0 严格便携模式只允许 EXE 同目录 data；拒绝使用：{}",
+                "严格便携模式只允许 EXE 同目录 data；拒绝使用：{}",
                 requested.display()
             ));
         }
@@ -5511,7 +5514,7 @@ fn spawn_explorer_target(target: &str, label: &str) -> Result<(), String> {
 }
 
 fn diagnostic_report(state: &AppState) -> String {
-    let mut lines = vec![format!("DSH Launcher v{APP_VERSION}"), "".to_owned()];
+    let mut lines = vec![format!("DSH启动器 v{APP_VERSION}"), "".to_owned()];
     if let Ok(status) = state.current_status.lock() {
         lines.push(format!("最近状态：{status}"));
     }
@@ -5760,6 +5763,15 @@ fn health_handshake_matches(contents: &str, expected_version: &str, expected_pid
 }
 
 fn run_app(health_path: Option<PathBuf>) -> Result<(), String> {
+    let app_user_model_id = to_wide(APP_USER_MODEL_ID);
+    let app_id_result =
+        unsafe { SetCurrentProcessExplicitAppUserModelID(app_user_model_id.as_ptr()) };
+    if app_id_result < 0 {
+        return Err(format!(
+            "设置 Windows 应用身份失败：0x{:08x}",
+            app_id_result as u32
+        ));
+    }
     let paths = app_paths()?;
     let high_contrast = high_contrast_enabled();
     let dark_mode = dark_mode_enabled(high_contrast);
@@ -5933,7 +5945,7 @@ fn run_app(health_path: Option<PathBuf>) -> Result<(), String> {
         add_tray_icon(
             hwnd,
             shared.tray_hicon.load(Ordering::Acquire) as HICON,
-            "DSH Launcher - 就绪",
+            "DSH启动器 · 就绪",
         )
     };
     if tray_result == 0 {
@@ -6047,7 +6059,7 @@ unsafe fn apply_window_theme(hwnd: HWND, state: &AppState) {
 }
 
 fn show_error_box(error: &str) {
-    let title = to_wide("DSH 启动器错误");
+    let title = to_wide("DSH启动器错误");
     let message = to_wide(error);
     unsafe {
         MessageBoxW(
@@ -6129,7 +6141,7 @@ unsafe fn create_controls(
             hwnd,
             hinstance,
             "STATIC",
-            "DSH 服务管理",
+            WINDOW_TITLE,
             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
             78,
             18,
@@ -6141,22 +6153,10 @@ unsafe fn create_controls(
             hwnd,
             hinstance,
             "STATIC",
-            "常用操作，一眼完成",
-            WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-            78,
-            52,
-            494,
-            22,
-            ID_SUBTITLE,
-        ),
-        create_control(
-            hwnd,
-            hinstance,
-            "STATIC",
             "正在检测 DSH 状态...",
             WS_CHILD | WS_VISIBLE | SS_OWNERDRAW,
             32,
-            92,
+            76,
             540,
             62,
             ID_STATUS,
@@ -6168,7 +6168,7 @@ unsafe fn create_controls(
             "常用操作",
             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
             32,
-            174,
+            158,
             540,
             24,
             ID_SECTION,
@@ -6180,7 +6180,7 @@ unsafe fn create_controls(
             "启动服务",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             32,
-            208,
+            192,
             262,
             58,
             CMD_START,
@@ -6192,7 +6192,7 @@ unsafe fn create_controls(
             "停止服务",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             310,
-            208,
+            192,
             262,
             58,
             CMD_STOP,
@@ -6204,7 +6204,7 @@ unsafe fn create_controls(
             "重启服务",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             32,
-            280,
+            192,
             262,
             58,
             CMD_RESTART,
@@ -6216,7 +6216,7 @@ unsafe fn create_controls(
             "更新 DSH",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             310,
-            280,
+            336,
             262,
             58,
             CMD_UPGRADE,
@@ -6228,7 +6228,7 @@ unsafe fn create_controls(
             "打开 Web UI",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             32,
-            352,
+            264,
             540,
             58,
             CMD_OPEN_WEB,
@@ -6240,7 +6240,7 @@ unsafe fn create_controls(
             "打开数据目录",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             32,
-            422,
+            406,
             182,
             48,
             CMD_OPEN_DATA,
@@ -6252,7 +6252,7 @@ unsafe fn create_controls(
             "验证并修复",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             224,
-            422,
+            406,
             170,
             48,
             CMD_REPAIR,
@@ -6264,7 +6264,7 @@ unsafe fn create_controls(
             "更新启动器",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             404,
-            422,
+            406,
             168,
             48,
             CMD_LAUNCHER_UPDATE,
@@ -6276,7 +6276,7 @@ unsafe fn create_controls(
             "更多工具",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             310,
-            352,
+            336,
             262,
             58,
             CMD_MORE_TOOLS,
@@ -6288,7 +6288,7 @@ unsafe fn create_controls(
             "返回首页",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             376,
-            430,
+            414,
             96,
             34,
             CMD_HOME,
@@ -6300,7 +6300,7 @@ unsafe fn create_controls(
             &footer,
             footer_style,
             32,
-            430,
+            414,
             334,
             34,
             ID_FOOTER,
@@ -6312,7 +6312,7 @@ unsafe fn create_controls(
             "诊断详情",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             32,
-            352,
+            336,
             540,
             58,
             CMD_DETAILS,
@@ -6324,7 +6324,7 @@ unsafe fn create_controls(
             "取消操作",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             376,
-            430,
+            414,
             96,
             34,
             CMD_CANCEL,
@@ -6336,7 +6336,7 @@ unsafe fn create_controls(
             "退出程序",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
             480,
-            430,
+            414,
             92,
             34,
             CMD_EXIT,
@@ -6350,7 +6350,7 @@ unsafe fn create_controls(
     set_control_fonts(hwnd, state);
     state
         .status_hwnd
-        .store(controls[2] as usize, Ordering::Release);
+        .store(controls[1] as usize, Ordering::Release);
     Ok(())
 }
 
@@ -6396,11 +6396,9 @@ unsafe fn set_control_fonts(hwnd: HWND, state: &AppState) {
     if !title_control.is_null() {
         SendMessageW(title_control, WM_SETFONT, title, 1);
     }
-    for id in [ID_SUBTITLE, ID_STATUS] {
-        let control = GetDlgItem(hwnd, id as i32);
-        if !control.is_null() {
-            SendMessageW(control, WM_SETFONT, body, 1);
-        }
+    let status_control = GetDlgItem(hwnd, ID_STATUS as i32);
+    if !status_control.is_null() {
+        SendMessageW(status_control, WM_SETFONT, body, 1);
     }
     for id in [
         ID_SECTION,
@@ -6481,23 +6479,22 @@ fn scale_for_dpi(value: i32, dpi: u32) -> i32 {
 unsafe fn layout_controls(hwnd: HWND, dpi: u32) {
     let controls = [
         (ID_TITLE, 78, 18, 494, 36),
-        (ID_SUBTITLE, 78, 52, 494, 22),
-        (ID_STATUS, 32, 92, 540, 62),
-        (ID_SECTION, 32, 174, 540, 24),
-        (CMD_START, 32, 208, 262, 58),
-        (CMD_STOP, 310, 208, 262, 58),
-        (CMD_OPEN_WEB, 32, 280, 540, 58),
-        (CMD_UPGRADE, 32, 352, 262, 58),
-        (CMD_MORE_TOOLS, 310, 352, 262, 58),
-        (CMD_RESTART, 32, 208, 262, 58),
-        (CMD_REPAIR, 310, 208, 262, 58),
-        (CMD_OPEN_DATA, 32, 280, 262, 58),
-        (CMD_LAUNCHER_UPDATE, 310, 280, 262, 58),
-        (CMD_DETAILS, 32, 352, 540, 58),
-        (ID_FOOTER, 32, 430, 334, 34),
-        (CMD_HOME, 376, 430, 96, 34),
-        (CMD_CANCEL, 376, 430, 96, 34),
-        (CMD_EXIT, 480, 430, 92, 34),
+        (ID_STATUS, 32, 76, 540, 62),
+        (ID_SECTION, 32, 158, 540, 24),
+        (CMD_START, 32, 192, 262, 58),
+        (CMD_STOP, 310, 192, 262, 58),
+        (CMD_OPEN_WEB, 32, 264, 540, 58),
+        (CMD_UPGRADE, 32, 336, 262, 58),
+        (CMD_MORE_TOOLS, 310, 336, 262, 58),
+        (CMD_RESTART, 32, 192, 262, 58),
+        (CMD_REPAIR, 310, 192, 262, 58),
+        (CMD_OPEN_DATA, 32, 264, 262, 58),
+        (CMD_LAUNCHER_UPDATE, 310, 264, 262, 58),
+        (CMD_DETAILS, 32, 336, 540, 58),
+        (ID_FOOTER, 32, 414, 334, 34),
+        (CMD_HOME, 376, 414, 96, 34),
+        (CMD_CANCEL, 376, 414, 96, 34),
+        (CMD_EXIT, 480, 414, 92, 34),
     ];
     for (id, x, y, width, height) in controls {
         let control = GetDlgItem(hwnd, id as i32);
@@ -6561,9 +6558,8 @@ unsafe fn refresh_page_visibility(hwnd: HWND, state: &AppState) {
 
 unsafe fn set_ui_page(hwnd: HWND, state: &AppState, page: UiPage, move_focus: bool) {
     state.ui_page.store(page.as_atomic(), Ordering::Release);
-    let (subtitle, section, focus_order): (&str, &str, &[u32]) = match page {
+    let (section, focus_order): (&str, &[u32]) = match page {
         UiPage::Home => (
-            "常用操作，一眼完成",
             "常用操作",
             &[
                 CMD_START,
@@ -6574,7 +6570,6 @@ unsafe fn set_ui_page(hwnd: HWND, state: &AppState, page: UiPage, move_focus: bo
             ],
         ),
         UiPage::Tools => (
-            "维护、更新与诊断",
             "更多工具",
             &[
                 CMD_RESTART,
@@ -6586,13 +6581,11 @@ unsafe fn set_ui_page(hwnd: HWND, state: &AppState, page: UiPage, move_focus: bo
             ],
         ),
     };
-    for (id, text) in [(ID_SUBTITLE, subtitle), (ID_SECTION, section)] {
-        let control = GetDlgItem(hwnd, id as i32);
-        if !control.is_null() {
-            let text = to_wide(text);
-            SetWindowTextW(control, text.as_ptr());
-            NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, control, OBJID_CLIENT, 0);
-        }
+    let section_control = GetDlgItem(hwnd, ID_SECTION as i32);
+    if !section_control.is_null() {
+        let text = to_wide(section);
+        SetWindowTextW(section_control, text.as_ptr());
+        NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, section_control, OBJID_CLIENT, 0);
     }
     refresh_page_visibility(hwnd, state);
     if move_focus {
@@ -6659,6 +6652,7 @@ unsafe fn set_status_text(state: &AppState, message: &str) {
 unsafe fn set_window_icon(hwnd: HWND, hicon: HICON) {
     SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, hicon as isize);
     SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, hicon as isize);
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL2 as usize, hicon as isize);
 }
 
 unsafe fn set_button_enabled(hwnd: HWND, id: u32, enabled: bool) {
@@ -7332,7 +7326,7 @@ unsafe extern "system" fn window_proc(
                 .current_status
                 .lock()
                 .map(|status| status.clone())
-                .unwrap_or_else(|_| "DSH Launcher".to_owned());
+                .unwrap_or_else(|_| "DSH启动器".to_owned());
             if add_tray_icon(
                 hwnd,
                 state.tray_hicon.load(Ordering::Acquire) as HICON,
@@ -7456,7 +7450,6 @@ unsafe extern "system" fn window_proc(
                 InvalidateRect(hwnd, std::ptr::null(), 1);
                 for id in [
                     ID_TITLE,
-                    ID_SUBTITLE,
                     ID_STATUS,
                     ID_SECTION,
                     ID_FOOTER,
@@ -7562,7 +7555,7 @@ unsafe extern "system" fn window_proc(
                     let result = add_tray_icon(
                         hwnd,
                         state.tray_hicon.load(Ordering::Acquire) as HICON,
-                        "DSH Launcher",
+                        "DSH启动器",
                     );
                     if result != 0 {
                         state.tray_added.store(true, Ordering::Release);
@@ -7571,7 +7564,7 @@ unsafe extern "system" fn window_proc(
                             .current_status
                             .lock()
                             .map(|status| status.clone())
-                            .unwrap_or_else(|_| "DSH Launcher".to_owned());
+                            .unwrap_or_else(|_| "DSH启动器".to_owned());
                         let _ = update_tray_tooltip(
                             hwnd,
                             state.tray_hicon.load(Ordering::Acquire) as HICON,
@@ -7616,9 +7609,9 @@ unsafe extern "system" fn window_proc(
                 if state.tray_added.load(Ordering::Acquire) {
                     if !state.close_notice_shown.swap(true, Ordering::AcqRel) {
                         let text = to_wide(
-                            "关闭窗口后，DSH 启动器会继续驻留系统托盘。右键托盘图标可重新打开或退出。",
+                            "关闭窗口后，DSH启动器会继续驻留系统托盘。右键托盘图标可重新打开或退出。",
                         );
-                        let title = to_wide("DSH 启动器");
+                        let title = to_wide("DSH启动器");
                         MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK);
                     }
                     KillTimer(hwnd, HOVER_TIMER_ID);
@@ -8079,7 +8072,12 @@ mod tests {
     fn runtime_bootstrap_sources_have_fixed_sha256_values() {
         let manifest = runtime_manifest().expect("bundled runtime manifest should parse");
         assert_eq!(manifest.node_sha256.len(), 64);
-        assert!(!manifest.dsh_peer_dependencies.is_empty());
+        assert_eq!(manifest.dsh_bootstrap_version, "0.1.2-alpha.3");
+        assert_eq!(
+            manifest.dsh_registry_url,
+            "https://registry.npmjs.org/@deepseek-ai%2fdsh"
+        );
+        assert!(manifest.dsh_peer_dependencies.is_empty());
         assert!(manifest.node_url.ends_with(&manifest.node_archive_name));
         assert!(manifest
             .node_url
@@ -8326,6 +8324,9 @@ mod tests {
         assert!(parse_dsh_semver("1.2.3-rc.10").unwrap() > parse_dsh_semver("1.2.3-rc.2").unwrap());
         assert!(parse_dsh_semver("01.2.3").is_none());
         assert!(parse_dsh_semver("1.2").is_none());
+        assert!(
+            parse_dsh_semver("0.1.2-alpha.3").unwrap() > parse_dsh_semver("0.1.1-rc.2").unwrap()
+        );
     }
 
     #[test]
@@ -8346,12 +8347,15 @@ mod tests {
     }
 
     #[test]
-    fn version_parser_ignores_npm_noise() {
+    fn latest_version_parser_considers_prereleases_outside_latest_dist_tag() {
         assert_eq!(
-            parse_dsh_version("npm notice checking\n0.1.1-rc.2\n"),
-            Some("0.1.1-rc.2".to_owned())
+            parse_latest_dsh_version(r#"["0.1.1-rc.2","0.1.2-alpha.2","0.1.2-alpha.3"]"#),
+            Some("0.1.2-alpha.3".to_owned())
         );
-        assert_eq!(parse_dsh_version("not a version"), None);
+        assert_eq!(
+            parse_latest_dsh_version("0.1.1-rc.2\n0.1.2-alpha.3\n"),
+            Some("0.1.2-alpha.3".to_owned())
+        );
     }
 
     #[test]
