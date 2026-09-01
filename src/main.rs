@@ -64,7 +64,7 @@ use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, IsWindowEnabled, VK_ESCAPE, VK_RETURN,
+    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 use windows_sys::Win32::UI::Shell::{
     IsUserAnAdmin, SHFileOperationW, Shell_NotifyIconW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
@@ -84,12 +84,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, DI_NORMAL, EVENT_OBJECT_NAMECHANGE, FVIRTKEY, GWLP_USERDATA, HICON, ICON_BIG,
     ICON_SMALL, IDC_ARROW, IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MB_YESNO, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, MSG, OBJID_CLIENT, SM_CXSCREEN, SM_CYSCREEN, SPI_GETHIGHCONTRAST,
-    SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, TPM_BOTTOMALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CTLCOLORSTATIC, WM_DESTROY,
-    WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NULL,
-    WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER,
-    WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_EX_TRANSPARENT,
-    WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
+    TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETICON,
+    WM_SETTINGCHANGE, WM_THEMECHANGED, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
+    WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_EX_TRANSPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED,
+    WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 #[link(name = "ntdll")]
@@ -214,6 +215,8 @@ const CMD_DETAILS: u32 = 1011;
 const CMD_CANCEL: u32 = 1012;
 const CMD_CLEANUP_LEGACY: u32 = 1013;
 const CMD_MIGRATE_LEGACY: u32 = 1014;
+const CMD_MORE_TOOLS: u32 = 1015;
+const CMD_HOME: u32 = 1016;
 const ID_TITLE: u32 = 1101;
 const ID_SUBTITLE: u32 = 1102;
 const ID_STATUS: u32 = 1103;
@@ -226,14 +229,14 @@ const HOVER_TIMER_INTERVAL_MS: u32 = 50;
 const HEALTH_TIMER_ID: usize = 3;
 const HEALTH_TIMER_INTERVAL_MS: u32 = 5000;
 const HOVER_STEPS: usize = 4;
-const HOVER_BUTTON_COUNT: usize = 11;
+const HOVER_BUTTON_COUNT: usize = 13;
 const WINDOW_CLASS: &str = "DeepSeekHarnessDshControlWindow";
 const WINDOW_TITLE: &str = "DSH 服务管理";
 const UI_FONT_FAMILY: &str = "Microsoft YaHei UI";
 const ICON_RESOURCE_ID: usize = 1;
 const BLACK_ICON_RESOURCE_ID: usize = 2;
 const WINDOW_WIDTH: i32 = 620;
-const WINDOW_HEIGHT: i32 = 610;
+const WINDOW_HEIGHT: i32 = 560;
 const BUTTON_STYLE: u32 = BS_OWNERDRAW as u32;
 
 const COLOR_BACKGROUND: u32 = rgb(239, 246, 255);
@@ -483,6 +486,7 @@ struct AppState {
     cancelable: AtomicBool,
     health_checking: AtomicBool,
     diagnostics_running: AtomicBool,
+    ui_page: AtomicUsize,
     hover_levels: [AtomicUsize; HOVER_BUTTON_COUNT],
     messages: Mutex<VecDeque<String>>,
     pending_diagnostic_report: Mutex<Option<String>>,
@@ -492,6 +496,29 @@ struct AppState {
     high_contrast: AtomicBool,
     dark_mode: AtomicBool,
     close_notice_shown: AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiPage {
+    Home,
+    Tools,
+}
+
+impl UiPage {
+    fn from_atomic(value: usize) -> Self {
+        if value == 1 {
+            Self::Tools
+        } else {
+            Self::Home
+        }
+    }
+
+    fn as_atomic(self) -> usize {
+        match self {
+            Self::Home => 0,
+            Self::Tools => 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5806,6 +5833,7 @@ fn run_app(health_path: Option<PathBuf>) -> Result<(), String> {
         cancelable: AtomicBool::new(false),
         health_checking: AtomicBool::new(false),
         diagnostics_running: AtomicBool::new(false),
+        ui_page: AtomicUsize::new(UiPage::Home.as_atomic()),
         hover_levels: std::array::from_fn(|_| AtomicUsize::new(0)),
         messages: Mutex::new(VecDeque::new()),
         pending_diagnostic_report: Mutex::new(None),
@@ -5865,6 +5893,7 @@ fn run_app(health_path: Option<PathBuf>) -> Result<(), String> {
     }
     unsafe {
         layout_controls(hwnd, GetDpiForWindow(hwnd).max(96));
+        set_ui_page(hwnd, &shared, UiPage::Home, false);
     }
     unsafe {
         SetTimer(hwnd, HOVER_TIMER_ID, HOVER_TIMER_INTERVAL_MS, None);
@@ -6055,12 +6084,9 @@ unsafe fn create_controls(
 ) -> Result<(), String> {
     let system_drive_warning = is_system_drive(Path::new(&state.data_root));
     let footer = if system_drive_warning {
-        "⚠ 系统盘数据\r\n停止后将便携目录整体移到 D 盘".to_owned()
+        "⚠ 数据位于系统盘 · 停止服务后可整体移动到 D 盘".to_owned()
     } else {
-        format!(
-            "v{APP_VERSION} · 托盘继续运行 · 数据目录：{}",
-            truncate(&state.data_root, 42)
-        )
+        format!("v{APP_VERSION} · 关闭窗口后继续在托盘运行")
     };
     let footer_style = WS_CHILD
         | WS_VISIBLE
@@ -6086,7 +6112,7 @@ unsafe fn create_controls(
             hwnd,
             hinstance,
             "STATIC",
-            "启动、停止与更新",
+            "常用操作，一眼完成",
             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
             78,
             52,
@@ -6110,7 +6136,7 @@ unsafe fn create_controls(
             hwnd,
             hinstance,
             "STATIC",
-            "快速操作",
+            "常用操作",
             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
             32,
             174,
@@ -6217,12 +6243,36 @@ unsafe fn create_controls(
         create_control(
             hwnd,
             hinstance,
+            "BUTTON",
+            "更多工具",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
+            310,
+            352,
+            262,
+            58,
+            CMD_MORE_TOOLS,
+        ),
+        create_control(
+            hwnd,
+            hinstance,
+            "BUTTON",
+            "返回首页",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
+            376,
+            430,
+            96,
+            34,
+            CMD_HOME,
+        ),
+        create_control(
+            hwnd,
+            hinstance,
             "STATIC",
             &footer,
             footer_style,
             32,
-            488,
-            250,
+            430,
+            334,
             34,
             ID_FOOTER,
         ),
@@ -6232,10 +6282,10 @@ unsafe fn create_controls(
             "BUTTON",
             "诊断详情",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
-            290,
-            488,
-            88,
-            34,
+            32,
+            352,
+            540,
+            58,
             CMD_DETAILS,
         ),
         create_control(
@@ -6244,9 +6294,9 @@ unsafe fn create_controls(
             "BUTTON",
             "取消操作",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
-            386,
-            488,
-            90,
+            376,
+            430,
+            96,
             34,
             CMD_CANCEL,
         ),
@@ -6256,9 +6306,9 @@ unsafe fn create_controls(
             "BUTTON",
             "退出程序",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BUTTON_STYLE,
-            482,
-            488,
-            90,
+            480,
+            430,
+            92,
             34,
             CMD_EXIT,
         ),
@@ -6267,11 +6317,45 @@ unsafe fn create_controls(
     if controls.iter().any(|control| control.is_null()) {
         return Err("创建窗口控件失败".to_owned());
     }
+    configure_button_tab_order(hwnd);
     set_control_fonts(hwnd, state);
     state
         .status_hwnd
         .store(controls[2] as usize, Ordering::Release);
     Ok(())
+}
+
+unsafe fn configure_button_tab_order(hwnd: HWND) {
+    let mut previous = GetDlgItem(hwnd, ID_SECTION as i32);
+    for id in [
+        CMD_START,
+        CMD_STOP,
+        CMD_OPEN_WEB,
+        CMD_UPGRADE,
+        CMD_MORE_TOOLS,
+        CMD_RESTART,
+        CMD_REPAIR,
+        CMD_OPEN_DATA,
+        CMD_LAUNCHER_UPDATE,
+        CMD_DETAILS,
+        CMD_HOME,
+        CMD_CANCEL,
+        CMD_EXIT,
+    ] {
+        let control = GetDlgItem(hwnd, id as i32);
+        if !control.is_null() {
+            SetWindowPos(
+                control,
+                previous,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+            previous = control;
+        }
+    }
 }
 
 unsafe fn set_control_fonts(hwnd: HWND, state: &AppState) {
@@ -6299,13 +6383,15 @@ unsafe fn set_control_fonts(hwnd: HWND, state: &AppState) {
         CMD_OPEN_DATA,
         CMD_REPAIR,
         CMD_LAUNCHER_UPDATE,
+        CMD_MORE_TOOLS,
+        CMD_DETAILS,
     ] {
         let control = GetDlgItem(hwnd, id as i32);
         if !control.is_null() {
             SendMessageW(control, WM_SETFONT, button, 1);
         }
     }
-    for id in [ID_FOOTER, CMD_DETAILS, CMD_CANCEL, CMD_EXIT] {
+    for id in [ID_FOOTER, CMD_HOME, CMD_CANCEL, CMD_EXIT] {
         let control = GetDlgItem(hwnd, id as i32);
         if !control.is_null() {
             SendMessageW(control, WM_SETFONT, small, 1);
@@ -6371,16 +6457,18 @@ unsafe fn layout_controls(hwnd: HWND, dpi: u32) {
         (ID_SECTION, 32, 174, 540, 24),
         (CMD_START, 32, 208, 262, 58),
         (CMD_STOP, 310, 208, 262, 58),
-        (CMD_RESTART, 32, 280, 262, 58),
-        (CMD_UPGRADE, 310, 280, 262, 58),
-        (CMD_OPEN_WEB, 32, 352, 540, 58),
-        (CMD_OPEN_DATA, 32, 422, 182, 48),
-        (CMD_REPAIR, 224, 422, 170, 48),
-        (CMD_LAUNCHER_UPDATE, 404, 422, 168, 48),
-        (ID_FOOTER, 32, 488, 250, 34),
-        (CMD_DETAILS, 290, 488, 88, 34),
-        (CMD_CANCEL, 386, 488, 90, 34),
-        (CMD_EXIT, 482, 488, 90, 34),
+        (CMD_OPEN_WEB, 32, 280, 540, 58),
+        (CMD_UPGRADE, 32, 352, 262, 58),
+        (CMD_MORE_TOOLS, 310, 352, 262, 58),
+        (CMD_RESTART, 32, 208, 262, 58),
+        (CMD_REPAIR, 310, 208, 262, 58),
+        (CMD_OPEN_DATA, 32, 280, 262, 58),
+        (CMD_LAUNCHER_UPDATE, 310, 280, 262, 58),
+        (CMD_DETAILS, 32, 352, 540, 58),
+        (ID_FOOTER, 32, 430, 334, 34),
+        (CMD_HOME, 376, 430, 96, 34),
+        (CMD_CANCEL, 376, 430, 96, 34),
+        (CMD_EXIT, 480, 430, 92, 34),
     ];
     for (id, x, y, width, height) in controls {
         let control = GetDlgItem(hwnd, id as i32);
@@ -6396,6 +6484,98 @@ unsafe fn layout_controls(hwnd: HWND, dpi: u32) {
             );
         }
     }
+}
+
+const PAGE_BUTTONS: [u32; HOVER_BUTTON_COUNT] = [
+    CMD_START,
+    CMD_STOP,
+    CMD_RESTART,
+    CMD_UPGRADE,
+    CMD_OPEN_WEB,
+    CMD_OPEN_DATA,
+    CMD_REPAIR,
+    CMD_LAUNCHER_UPDATE,
+    CMD_DETAILS,
+    CMD_CANCEL,
+    CMD_EXIT,
+    CMD_MORE_TOOLS,
+    CMD_HOME,
+];
+
+fn control_visible_on_page(page: UiPage, id: u32, busy: bool) -> bool {
+    match id {
+        CMD_START | CMD_STOP | CMD_UPGRADE | CMD_OPEN_WEB | CMD_MORE_TOOLS => page == UiPage::Home,
+        CMD_RESTART | CMD_OPEN_DATA | CMD_REPAIR | CMD_LAUNCHER_UPDATE | CMD_DETAILS => {
+            page == UiPage::Tools
+        }
+        CMD_HOME => page == UiPage::Tools && !busy,
+        CMD_CANCEL => busy,
+        CMD_EXIT => true,
+        _ => true,
+    }
+}
+
+unsafe fn set_control_visible(hwnd: HWND, id: u32, visible: bool) {
+    let control = GetDlgItem(hwnd, id as i32);
+    if !control.is_null() {
+        ShowWindow(control, if visible { SW_SHOW } else { SW_HIDE });
+    }
+}
+
+unsafe fn refresh_page_visibility(hwnd: HWND, state: &AppState) {
+    let page = UiPage::from_atomic(state.ui_page.load(Ordering::Acquire));
+    let busy = state.busy.load(Ordering::Acquire);
+    for id in PAGE_BUTTONS {
+        set_control_visible(hwnd, id, control_visible_on_page(page, id, busy));
+    }
+}
+
+unsafe fn set_ui_page(hwnd: HWND, state: &AppState, page: UiPage, move_focus: bool) {
+    state.ui_page.store(page.as_atomic(), Ordering::Release);
+    let (subtitle, section, focus_order): (&str, &str, &[u32]) = match page {
+        UiPage::Home => (
+            "常用操作，一眼完成",
+            "常用操作",
+            &[
+                CMD_START,
+                CMD_STOP,
+                CMD_OPEN_WEB,
+                CMD_UPGRADE,
+                CMD_MORE_TOOLS,
+            ],
+        ),
+        UiPage::Tools => (
+            "维护、更新与诊断",
+            "更多工具",
+            &[
+                CMD_RESTART,
+                CMD_REPAIR,
+                CMD_OPEN_DATA,
+                CMD_LAUNCHER_UPDATE,
+                CMD_DETAILS,
+                CMD_HOME,
+            ],
+        ),
+    };
+    for (id, text) in [(ID_SUBTITLE, subtitle), (ID_SECTION, section)] {
+        let control = GetDlgItem(hwnd, id as i32);
+        if !control.is_null() {
+            let text = to_wide(text);
+            SetWindowTextW(control, text.as_ptr());
+            NotifyWinEvent(EVENT_OBJECT_NAMECHANGE, control, OBJID_CLIENT, 0);
+        }
+    }
+    refresh_page_visibility(hwnd, state);
+    if move_focus {
+        for id in focus_order {
+            let control = GetDlgItem(hwnd, *id as i32);
+            if !control.is_null() && IsWindowEnabled(control) != 0 {
+                SetFocus(control);
+                break;
+            }
+        }
+    }
+    InvalidateRect(hwnd, std::ptr::null(), 1);
 }
 
 unsafe fn recreate_ui_fonts(hwnd: HWND, state: &AppState, dpi: u32) {
@@ -6477,6 +6657,7 @@ unsafe fn refresh_action_buttons(hwnd: HWND, state: &AppState) {
         }
         set_button_enabled(hwnd, CMD_DETAILS, true);
         set_button_enabled(hwnd, CMD_CANCEL, state.cancelable.load(Ordering::Acquire));
+        refresh_page_visibility(hwnd, state);
         return;
     }
     let status = state
@@ -6497,10 +6678,13 @@ unsafe fn refresh_action_buttons(hwnd: HWND, state: &AppState) {
         CMD_LAUNCHER_UPDATE,
         CMD_DETAILS,
         CMD_EXIT,
+        CMD_MORE_TOOLS,
+        CMD_HOME,
     ] {
         set_button_enabled(hwnd, id, true);
     }
     set_button_enabled(hwnd, CMD_CANCEL, false);
+    refresh_page_visibility(hwnd, state);
 }
 
 unsafe fn paint_window(hwnd: HWND, state: &AppState) {
@@ -6764,7 +6948,7 @@ unsafe fn draw_button(state: &AppState, item: &DRAWITEMSTRUCT) {
         scale(11),
     );
 
-    if matches!(item.CtlID, CMD_EXIT | CMD_DETAILS | CMD_CANCEL) {
+    if matches!(item.CtlID, CMD_EXIT | CMD_HOME | CMD_CANCEL) {
         draw_text(
             item.hDC,
             state.small_font.load(Ordering::Acquire),
@@ -6958,7 +7142,9 @@ fn button_spec(id: u32) -> (&'static str, &'static str, u32, &'static str) {
         CMD_OPEN_DATA => ("打开数据目录", "查看便携数据", COLOR_BLUE, "⌂"),
         CMD_REPAIR => ("验证并修复", "重新检查运行时", COLOR_AMBER, "✓"),
         CMD_LAUNCHER_UPDATE => ("更新启动器", "官方 Release", COLOR_PURPLE, "↑"),
-        CMD_DETAILS => ("诊断详情", "", COLOR_BORDER, ""),
+        CMD_DETAILS => ("诊断详情", "查看错误、日志与修复建议", COLOR_CYAN, "i"),
+        CMD_MORE_TOOLS => ("更多工具", "维护、诊断与启动器更新", COLOR_CYAN, "⋯"),
+        CMD_HOME => ("返回首页", "", COLOR_BORDER, ""),
         CMD_CANCEL => ("取消操作", "", COLOR_BORDER, ""),
         CMD_EXIT => ("退出程序", "", COLOR_BORDER, ""),
         _ => ("", "", COLOR_BORDER, ""),
@@ -6975,6 +7161,7 @@ fn button_tint(id: u32) -> u32 {
         CMD_OPEN_DATA => rgb(222, 239, 255),
         CMD_REPAIR => rgb(255, 244, 216),
         CMD_LAUNCHER_UPDATE => rgb(239, 231, 255),
+        CMD_DETAILS | CMD_MORE_TOOLS => rgb(220, 244, 248),
         _ => rgb(232, 238, 246),
     }
 }
@@ -6992,6 +7179,8 @@ fn button_index(id: u32) -> Option<usize> {
         CMD_DETAILS => Some(8),
         CMD_CANCEL => Some(9),
         CMD_EXIT => Some(10),
+        CMD_MORE_TOOLS => Some(11),
+        CMD_HOME => Some(12),
         _ => None,
     }
 }
@@ -7023,19 +7212,7 @@ unsafe fn animate_hover(hwnd: HWND, state: &AppState) {
         0
     };
 
-    for id in [
-        CMD_START,
-        CMD_STOP,
-        CMD_RESTART,
-        CMD_UPGRADE,
-        CMD_OPEN_WEB,
-        CMD_OPEN_DATA,
-        CMD_REPAIR,
-        CMD_LAUNCHER_UPDATE,
-        CMD_DETAILS,
-        CMD_CANCEL,
-        CMD_EXIT,
-    ] {
+    for id in PAGE_BUTTONS {
         let index = button_index(id).expect("button id must have a hover index");
         let current = state.hover_levels[index].load(Ordering::Acquire);
         let next = if id == hovered_id {
@@ -7183,6 +7360,14 @@ unsafe extern "system" fn window_proc(
                 if let Some(state) = state_for(hwnd) {
                     request_diagnostics(hwnd, state);
                 }
+            } else if command == CMD_MORE_TOOLS {
+                if let Some(state) = state_for(hwnd) {
+                    set_ui_page(hwnd, &state, UiPage::Tools, true);
+                }
+            } else if command == CMD_HOME {
+                if let Some(state) = state_for(hwnd) {
+                    set_ui_page(hwnd, &state, UiPage::Home, true);
+                }
             } else if command == CMD_CLEANUP_LEGACY {
                 if let Some(state) = state_for(hwnd) {
                     request_legacy_cleanup(hwnd, state);
@@ -7257,6 +7442,8 @@ unsafe extern "system" fn window_proc(
                     CMD_DETAILS,
                     CMD_CANCEL,
                     CMD_EXIT,
+                    CMD_MORE_TOOLS,
+                    CMD_HOME,
                 ] {
                     let control = GetDlgItem(hwnd, id as i32);
                     if !control.is_null() {
@@ -8201,6 +8388,48 @@ mod tests {
         assert!(!is_uncancellable_stage("正在下载更新..."));
         assert!(status_is_abnormal("运行时需要修复：清单不一致"));
         assert!(!status_is_abnormal("服务已停止"));
+    }
+
+    #[test]
+    fn home_page_only_exposes_frequent_actions() {
+        for id in [
+            CMD_START,
+            CMD_STOP,
+            CMD_OPEN_WEB,
+            CMD_UPGRADE,
+            CMD_MORE_TOOLS,
+        ] {
+            assert!(control_visible_on_page(UiPage::Home, id, false));
+        }
+        for id in [
+            CMD_RESTART,
+            CMD_REPAIR,
+            CMD_OPEN_DATA,
+            CMD_LAUNCHER_UPDATE,
+            CMD_DETAILS,
+            CMD_HOME,
+            CMD_CANCEL,
+        ] {
+            assert!(!control_visible_on_page(UiPage::Home, id, false));
+        }
+        assert!(control_visible_on_page(UiPage::Home, CMD_EXIT, false));
+    }
+
+    #[test]
+    fn tools_page_swaps_back_navigation_for_busy_cancel() {
+        for id in [
+            CMD_RESTART,
+            CMD_REPAIR,
+            CMD_OPEN_DATA,
+            CMD_LAUNCHER_UPDATE,
+            CMD_DETAILS,
+            CMD_HOME,
+        ] {
+            assert!(control_visible_on_page(UiPage::Tools, id, false));
+        }
+        assert!(!control_visible_on_page(UiPage::Tools, CMD_CANCEL, false));
+        assert!(!control_visible_on_page(UiPage::Tools, CMD_HOME, true));
+        assert!(control_visible_on_page(UiPage::Tools, CMD_CANCEL, true));
     }
 
     #[test]
