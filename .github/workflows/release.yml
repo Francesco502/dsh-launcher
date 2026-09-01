@@ -38,8 +38,10 @@ jobs:
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
-          rustup toolchain install 1.97.0 --profile minimal --target x86_64-pc-windows-gnu
+          rustup toolchain install 1.97.0 --profile minimal --target x86_64-pc-windows-gnu --component rustfmt --component clippy
           rustup run 1.97.0 rustc --version
+          rustup run 1.97.0 cargo fmt --version
+          rustup run 1.97.0 cargo clippy --version
 
       - name: Validate release metadata
         shell: pwsh
