@@ -85,8 +85,23 @@ jobs:
           $smokeRoot = Join-Path $env:USERPROFILE "dsh-launcher-ci-smoke-$PID"
           Expand-Archive -LiteralPath "dist\DSH-Launcher-Portable-x64.zip" -DestinationPath $smokeRoot -Force
           $launcher = Join-Path $smokeRoot "DSH-Launcher-Portable-x64\DSH-Launcher.exe"
-          $output = @(& $launcher --release-smoke 2>&1)
-          $exitCode = $LASTEXITCODE
+          $stdoutPath = Join-Path $smokeRoot "release-smoke.stdout.log"
+          $stderrPath = Join-Path $smokeRoot "release-smoke.stderr.log"
+          try {
+            $process = Start-Process -FilePath $launcher `
+              -ArgumentList "--release-smoke" `
+              -Wait -PassThru -NoNewWindow `
+              -RedirectStandardOutput $stdoutPath `
+              -RedirectStandardError $stderrPath
+          } catch {
+            Write-Output "::error title=Portable initialization smoke test could not start::$($_.Exception.Message)"
+            throw
+          }
+          $output = @(
+            if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath }
+            if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath }
+          )
+          $exitCode = $process.ExitCode
           $output | ForEach-Object { Write-Output $_ }
           if ($exitCode -ne 0) {
             $summary = (($output | ForEach-Object { [string]$_ }) -join " ").Replace("`r", "").Replace("`n", " ")
