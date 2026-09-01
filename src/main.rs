@@ -599,6 +599,20 @@ fn main() {
         };
         std::process::exit(code);
     }
+    if is_release_smoke(&args) {
+        attach_parent_console();
+        let code = match run_release_smoke() {
+            Ok(message) => {
+                write_cli_message(&message, false);
+                0
+            }
+            Err(error) => {
+                write_cli_message(&error, true);
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     let health_path = match self_update_health_path(&args) {
         Ok(path) => path,
         Err(error) => {
@@ -642,6 +656,21 @@ fn main() {
         show_error_box(&error);
         std::process::exit(1);
     }
+}
+
+fn is_release_smoke(args: &[String]) -> bool {
+    args.len() == 2 && args[1] == "--release-smoke"
+}
+
+fn run_release_smoke() -> Result<String, String> {
+    let paths = app_paths()?;
+    let executable = env::current_exe().map_err(|error| format!("无法定位启动器目录：{error}"))?;
+    let executable_dir = executable
+        .parent()
+        .ok_or_else(|| "无法定位启动器目录".to_owned())?;
+    verify_portable_manifest(executable_dir)?;
+    paths.ensure_layout()?;
+    Ok(format!("DSH Launcher v{APP_VERSION} 便携包初始化检查通过"))
 }
 
 fn parse_self_update(args: &[String]) -> Option<PathBuf> {
@@ -8258,6 +8287,20 @@ mod tests {
             "unexpected".to_owned(),
         ];
         assert!(parse_self_update(&invalid_pid).is_none());
+    }
+
+    #[test]
+    fn release_smoke_flag_requires_an_exact_standalone_argument() {
+        assert!(is_release_smoke(&[
+            "dsh-launcher.exe".to_owned(),
+            "--release-smoke".to_owned(),
+        ]));
+        assert!(!is_release_smoke(&["dsh-launcher.exe".to_owned()]));
+        assert!(!is_release_smoke(&[
+            "dsh-launcher.exe".to_owned(),
+            "--release-smoke".to_owned(),
+            "unexpected".to_owned(),
+        ]));
     }
 
     #[test]

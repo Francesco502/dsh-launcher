@@ -86,14 +86,14 @@ jobs:
             Remove-Item -LiteralPath $smokeRoot -Recurse -Force
           }
           Expand-Archive -LiteralPath "dist\DSH-Launcher-Portable-x64.zip" -DestinationPath $smokeRoot -Force
-          $control = Join-Path $smokeRoot "DSH-Launcher-Portable-x64\dshctl.cmd"
-          $output = @(& $control stop 2>&1)
+          $launcher = Join-Path $smokeRoot "DSH-Launcher-Portable-x64\DSH-Launcher.exe"
+          $output = @(& $launcher --release-smoke 2>&1)
           $exitCode = $LASTEXITCODE
           $output | ForEach-Object { Write-Output $_ }
           if ($exitCode -ne 0) {
             $summary = (($output | ForEach-Object { [string]$_ }) -join " ").Replace("`r", "").Replace("`n", " ")
-            Write-Output "::error title=Portable smoke test failed::$summary"
-            throw "Extracted portable bundle command-line smoke test failed with exit code $exitCode."
+            Write-Output "::error title=Portable initialization smoke test failed::$summary"
+            throw "Extracted portable bundle initialization smoke test failed with exit code $exitCode."
           }
           Remove-Item -LiteralPath $smokeRoot -Recurse -Force
 
