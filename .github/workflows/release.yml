@@ -244,7 +244,14 @@ jobs:
             draft = $true
             prerelease = $false
             generate_release_notes = $false
-            body = "DSH Launcher $env:GITHUB_REF_NAME. This Windows x64 release is unsigned (authenticode_status: unsigned). DSH-Launcher-Portable-x64.zip is the supported lightweight package. It contains no Node.js or DSH runtime. Install Node.js separately when absent; DSH install and update are explicit user actions. DSH-Launcher.exe is a technical asset and is not a standalone portable package."
+            body = @(
+              "DSH Launcher $env:GITHUB_REF_NAME (Windows 10/11 x64; unsigned, authenticode_status: unsigned).",
+              "",
+              "CLI compatibility: the public commands are start, stop, upgrade, and open. The removed restart, repair, migrate, launcher-update, data, and --data-dir forms are no longer accepted.",
+              "Runtime requirement: DSH-Launcher-Portable-x64.zip is the supported lightweight package and contains no Node.js or DSH runtime. Install Node.js separately when it is absent; DSH installation and upgrades are explicit user actions.",
+              "Launcher updates: use the footer Check for launcher updates action to compare the official GitHub Release version and open the release page, then download and replace the launcher from that release manually.",
+              "DSH-Launcher.exe is a technical asset and is not a standalone portable package."
+            ) -join "`n"
           }
           $existing = @(
             Invoke-RestMethod -Method Get -Uri "${releaseApi}?per_page=100" -Headers $headers |
