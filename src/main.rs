@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::env;
 use std::ffi::{c_void, OsStr};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
-    AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    AttachConsole, GetConsoleMode, GetStdHandle, WriteConsoleW, ATTACH_PARENT_PROCESS,
+    STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::SS_CENTER;
@@ -340,6 +341,7 @@ struct Snapshot {
     npm_available: bool,
     running: bool,
     healthy: bool,
+    auth_unavailable: bool,
     repair_needed: bool,
     discovery_error: Option<String>,
 }
@@ -494,7 +496,7 @@ fn run_release_smoke() -> Result<String, String> {
 
 fn execute_action(action: Action) -> Result<String, String> {
     let paths = app_paths()?;
-    recover_update_transaction(&paths)?;
+    recover_for_use(&paths)?;
     match action {
         Action::Start => start_dsh(),
         Action::Stop => stop_dsh(),
@@ -690,6 +692,7 @@ fn inspect_snapshot(paths: &Paths, installation: Option<Installation>) -> Snapsh
         npm_available,
         running,
         healthy,
+        auth_unavailable: probe.identified && !healthy,
         repair_needed,
         discovery_error: None,
     }
@@ -708,6 +711,9 @@ fn refresh_discovery(paths: &Paths) -> Snapshot {
 
 fn start_dsh() -> Result<String, String> {
     let paths = app_paths()?;
+    if paths.repair_file().is_file() {
+        return Err("DSH 最新版本需要重新安装；请先使用“重新安装 DSH”或 upgrade。".to_owned());
+    }
     let installation = discover_installation(&paths)?
         .ok_or_else(|| "未找到 DSH；请先在启动器中安装 DSH。".to_owned())?;
     start_installation(&paths, &installation)
@@ -832,7 +838,7 @@ fn install_or_update(
     };
     let repair_version = read_repair_version(&paths);
     let repair_requested =
-        repair_version.is_some() || (paths.managed_package().exists() && current.is_none());
+        paths.repair_file().is_file() || (paths.managed_package().exists() && current.is_none());
     if current.is_none() && !allow_install && !repair_requested {
         return Err("未找到 DSH；请先使用“安装 DSH”。".to_owned());
     }
@@ -1146,18 +1152,39 @@ fn promote_stage(
 fn recover_update_transaction(paths: &Paths) -> Result<(), String> {
     let transaction = match read_transaction(paths) {
         Ok(Some(transaction)) => transaction,
+        Ok(None) if paths.repair_file().is_file() => return Ok(()),
         Ok(None) => return cleanup_update_artifacts(paths),
         Err(error) => {
             append_log(
                 &paths.logs.join("launcher.log"),
                 &format!("更新事务损坏，按最新暂存恢复：{error}"),
             );
-            let _ = fs::remove_file(paths.transaction_file());
             return recover_orphaned_stage(paths);
         }
     };
 
     let mut transaction = transaction;
+    write_profile_mode(paths, transaction.profile)?;
+    let candidate = if transaction.stage.exists() {
+        &transaction.stage
+    } else {
+        if transaction.phase == "prepared"
+            && transaction
+                .backup
+                .as_ref()
+                .is_some_and(|path| !path.exists())
+        {
+            return recovery_failed(
+                paths,
+                &transaction.stage,
+                "更新尚未提交且最新暂存目录已丢失",
+            );
+        }
+        &transaction.target
+    };
+    if let Err(error) = verify_recovery_candidate(candidate) {
+        return recovery_failed(paths, candidate, &error);
+    }
     if transaction.stage.exists() {
         if transaction.target.exists() {
             if let Some(backup) = &transaction.backup {
@@ -1174,13 +1201,48 @@ fn recover_update_transaction(paths: &Paths) -> Result<(), String> {
         fs::rename(&transaction.stage, &transaction.target)
             .map_err(|error| format!("无法继续提交最新 DSH：{error}"))?;
     }
-    if !transaction.target.exists() {
-        return Err("更新中断且最新 DSH 暂存目录不存在；请重新安装当前最新版。".to_owned());
-    }
     transaction.phase = "committed".to_owned();
     write_transaction(paths, &transaction)?;
-    write_profile_mode(paths, transaction.profile)?;
-    finalize_committed_transaction(paths)
+    finalize_committed_transaction(paths)?;
+    clear_repair_needed(paths);
+    Ok(())
+}
+
+fn recovery_version(prefix: &Path) -> Option<String> {
+    let text =
+        fs::read_to_string(prefix.join("node_modules/@deepseek-ai/dsh/package.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if value.get("name")?.as_str()? != "@deepseek-ai/dsh" {
+        return None;
+    }
+    let version = value.get("version")?.as_str()?;
+    parse_version(version).map(|_| version.to_owned())
+}
+
+fn verify_recovery_candidate(prefix: &Path) -> Result<(), String> {
+    let version =
+        recovery_version(prefix).ok_or_else(|| "更新候选丢失或 DSH 元数据无效".to_owned())?;
+    verify_staged_package(&prefix.join("node_modules/@deepseek-ai/dsh"), &version)
+}
+
+fn recovery_failed(paths: &Paths, candidate: &Path, reason: &str) -> Result<(), String> {
+    let version = recovery_version(candidate).or_else(|| read_repair_version(paths));
+    atomic_write(&paths.repair_file(), version.unwrap_or_default().as_bytes())?;
+    fs::remove_file(paths.transaction_file())
+        .map_err(|error| format!("无法结束损坏的更新事务：{error}"))?;
+    Err(format!(
+        "{reason}；请重新安装 DSH 最新版本，旧版本不会重新启用。"
+    ))
+}
+
+fn recover_for_use(paths: &Paths) -> Result<(), String> {
+    match recover_update_transaction(paths) {
+        Err(error) if paths.repair_file().is_file() && !paths.transaction_file().exists() => {
+            append_log(&paths.logs.join("launcher.log"), &error);
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn finalize_committed_transaction(paths: &Paths) -> Result<(), String> {
@@ -1200,7 +1262,7 @@ fn finalize_committed_transaction(paths: &Paths) -> Result<(), String> {
     }
     fs::remove_file(paths.transaction_file())
         .map_err(|error| format!("无法清理更新事务：{error}"))?;
-    Ok(())
+    cleanup_update_artifacts(paths)
 }
 
 fn write_transaction(paths: &Paths, transaction: &UpdateTransaction) -> Result<(), String> {
@@ -1253,17 +1315,19 @@ fn recover_orphaned_stage(paths: &Paths) -> Result<(), String> {
     let mut stages = update_directories(paths, "dsh-stage-")?;
     stages.sort_by_key(|path| path.metadata().and_then(|value| value.modified()).ok());
     if let Some(stage) = stages.pop() {
-        if paths.npm_prefix.exists() {
-            let old = paths
-                .updates
-                .join(format!("dsh-old-recovery-{}", transaction_nonce()));
-            fs::rename(&paths.npm_prefix, &old)
-                .map_err(|error| format!("无法移出旧 DSH：{error}"))?;
+        if let Err(error) = verify_recovery_candidate(&stage) {
+            return recovery_failed(paths, &stage, &error);
         }
-        fs::rename(&stage, &paths.npm_prefix)
-            .map_err(|error| format!("无法恢复最新 DSH 暂存目录：{error}"))?;
+        promote_stage(
+            paths,
+            &stage,
+            read_profile_mode(paths).unwrap_or(ProfileMode::Portable),
+        )?;
+        finalize_committed_transaction(paths)?;
+        clear_repair_needed(paths);
+        return Ok(());
     }
-    cleanup_update_artifacts(paths)
+    recovery_failed(paths, &paths.updates, "事务损坏且没有可验证的最新暂存目录")
 }
 
 fn cleanup_update_artifacts(paths: &Paths) -> Result<(), String> {
@@ -1655,17 +1719,61 @@ fn classify_dsh_response(response: &[u8]) -> ProbeResponse {
     }
 }
 
+#[derive(Default)]
+struct AuthLogCache {
+    path: PathBuf,
+    created: Option<SystemTime>,
+    modified: Option<SystemTime>,
+    length: u64,
+    offset: u64,
+    url: Option<String>,
+}
+
 fn logged_web_url(paths: &Paths) -> Option<String> {
-    let mut file = fs::File::open(paths.logs.join("dsh.out.log")).ok()?;
-    let length = file.metadata().ok()?.len();
-    file.seek(SeekFrom::Start(length.saturating_sub(8192)))
+    static CACHE: OnceLock<Mutex<AuthLogCache>> = OnceLock::new();
+    let path = paths.logs.join("dsh.out.log");
+    let mut file = fs::File::open(&path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let mut cache = CACHE
+        .get_or_init(|| Mutex::new(AuthLogCache::default()))
+        .lock()
         .ok()?;
-    let mut text = String::new();
-    file.read_to_string(&mut text).ok()?;
-    text.lines().rev().find_map(|line| {
-        let url = line.trim().strip_prefix("dsh web: ")?.trim();
-        valid_web_url(url).then(|| url.to_owned())
-    })
+    let created = metadata.created().ok();
+    let modified = metadata.modified().ok();
+    let length = metadata.len();
+    if cache.path != path
+        || cache.created != created
+        || length < cache.length
+        || (length == cache.length && modified != cache.modified)
+    {
+        *cache = AuthLogCache {
+            path,
+            created,
+            ..AuthLogCache::default()
+        };
+    }
+    if cache.length != length || cache.modified != modified {
+        file.seek(SeekFrom::Start(cache.offset)).ok()?;
+        let mut reader = BufReader::new(file.take(length.saturating_sub(cache.offset)));
+        let mut line = Vec::new();
+        while reader.read_until(b'\n', &mut line).ok()? != 0 {
+            let text = String::from_utf8_lossy(&line);
+            if let Some(url) = text.trim().strip_prefix("dsh web: ").map(str::trim) {
+                if valid_web_url(url) {
+                    cache.url = Some(url.to_owned());
+                }
+            }
+            // Reread a partial final line when the writer appends its remainder.
+            if !line.ends_with(b"\n") {
+                break;
+            }
+            cache.offset += line.len() as u64;
+            line.clear();
+        }
+        cache.length = length;
+        cache.modified = modified;
+    }
+    cache.url.clone()
 }
 
 fn valid_web_url(url: &str) -> bool {
@@ -1987,7 +2095,7 @@ fn create_mutex(name: &str) -> Option<MutexGuard> {
 fn run_app() -> Result<(), String> {
     let paths = app_paths()?;
     if let Some(_guard) = acquire_action_mutex() {
-        recover_update_transaction(&paths)?;
+        recover_for_use(&paths)?;
         cleanup_npm_cache(&paths);
     } else {
         append_log(
@@ -2659,6 +2767,7 @@ unsafe fn refresh_controls(hwnd: HWND, state: &AppState) {
             npm_available: false,
             running: false,
             healthy: false,
+            auth_unavailable: false,
             repair_needed: false,
             discovery_error: None,
         });
@@ -2732,7 +2841,7 @@ unsafe fn handle_main_button(hwnd: HWND) {
             let _ = open_url(NODE_DOWNLOAD_URL);
             show_info_box(
                 hwnd,
-                "请安装 Node.js LTS。安装完成后重新打开面板，启动器会在本机重新检测 Node.js 和 npm。",
+                "请安装 Node.js LTS。安装完成后，请在托盘菜单选择“退出”，再重新运行启动器；仅关闭或重新打开面板不会刷新 Node.js 和 npm 的安装路径。",
             );
         }
         MainButton::RepairDsh => request_operation(hwnd, Operation::Upgrade),
@@ -2772,7 +2881,7 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
             state.cancelable.store(cancelable, Ordering::Release);
             push_status(hwnd_value as HWND, &state, message.to_owned());
         };
-        let result = match operation {
+        let result = recover_for_use(&state.paths).and_then(|_| match operation {
             Operation::Start => start_dsh(),
             Operation::Stop => stop_dsh(),
             Operation::Install => {
@@ -2783,7 +2892,7 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
                 let confirm = |message: &str| unsafe { confirm_box(hwnd_value as HWND, message) };
                 install_or_update(false, &progress, Some(&confirm))
             }
-        };
+        });
         finish_operation(hwnd_value as HWND, &state, result);
     });
 }
@@ -2868,6 +2977,7 @@ unsafe fn schedule_health(hwnd: HWND, state: Arc<AppState>) {
         let tracked = tracked_process_running(&state.paths).unwrap_or(false);
         let probe = probe_dsh(&state.paths);
         snapshot.healthy = probe.web_url.is_some();
+        snapshot.auth_unavailable = probe.identified && !snapshot.healthy;
         snapshot.running = tracked || probe.identified;
         let status = status_for_snapshot(&snapshot);
         if let Ok(mut current) = state.snapshot.lock() {
@@ -2892,6 +3002,8 @@ fn status_for_snapshot(snapshot: &Snapshot) -> String {
             .map(|value| format!(" · DSH {}", value.version))
             .unwrap_or_default();
         format!("运行中{version} · {WEB_URL}")
+    } else if snapshot.auth_unavailable {
+        "DSH 已运行，但认证 URL 不可用；请停止后由启动器重新启动。".to_owned()
     } else if snapshot.running {
         "DSH 进程存在，但 Web UI 未就绪".to_owned()
     } else if let Some(error) = &snapshot.discovery_error {
@@ -3157,7 +3269,9 @@ fn attach_console() {
 fn write_console(message: &str, error: bool) {
     let text = format!("{message}\r\n");
     if let Some(path) = env::var_os(CLI_OUTPUT_ENV).map(PathBuf::from) {
-        let _ = fs::write(path, text.as_bytes());
+        if fs::write(path, text.as_bytes()).is_ok() {
+            return;
+        }
     }
     let handle = unsafe {
         GetStdHandle(if error {
@@ -3167,16 +3281,7 @@ fn write_console(message: &str, error: bool) {
         })
     };
     if !handle.is_null() && handle != -1isize as HANDLE {
-        let mut written = 0u32;
-        unsafe {
-            let _ = WriteFile(
-                handle,
-                text.as_ptr(),
-                text.len() as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            );
-        }
+        write_console_handle(handle, &text);
     } else {
         let device = to_wide("CONOUT$");
         let handle = unsafe {
@@ -3191,17 +3296,35 @@ fn write_console(message: &str, error: bool) {
             )
         };
         if !handle.is_null() && handle != -1isize as HANDLE {
-            let mut written = 0u32;
+            write_console_handle(handle, &text);
             unsafe {
-                let _ = WriteFile(
-                    handle,
-                    text.as_ptr(),
-                    text.len() as u32,
-                    &mut written,
-                    std::ptr::null_mut(),
-                );
                 CloseHandle(handle);
             }
+        }
+    }
+}
+
+fn write_console_handle(handle: HANDLE, text: &str) {
+    let mut mode = 0;
+    let mut written = 0;
+    unsafe {
+        if GetConsoleMode(handle, &mut mode) != 0 {
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let _ = WriteConsoleW(
+                handle,
+                wide.as_ptr(),
+                wide.len() as u32,
+                &mut written,
+                std::ptr::null(),
+            );
+        } else {
+            let _ = WriteFile(
+                handle,
+                text.as_ptr(),
+                text.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            );
         }
     }
 }
@@ -3244,6 +3367,20 @@ mod tests {
         }
     }
 
+    fn write_test_package(prefix: &Path, version: &str) {
+        let package = prefix.join("node_modules/@deepseek-ai/dsh");
+        fs::create_dir_all(package.join("lib")).unwrap();
+        fs::write(package.join("lib/bin.js"), "// test fixture").unwrap();
+        fs::write(
+            package.join("package.json"),
+            serde_json::json!({
+                "name": "@deepseek-ai/dsh", "version": version, "dependencies": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
     fn snapshot(installed: bool, node: bool, npm: bool, running: bool) -> Snapshot {
         Snapshot {
             installation: installed.then(|| Installation {
@@ -3257,6 +3394,7 @@ mod tests {
             npm_available: npm,
             running,
             healthy: running,
+            auth_unavailable: false,
             repair_needed: false,
             discovery_error: None,
         }
@@ -3528,6 +3666,7 @@ mod tests {
         let backup = paths.updates.join("rollback");
         fs::create_dir_all(&stage).unwrap();
         fs::write(stage.join("new.txt"), "new").unwrap();
+        write_test_package(&stage, "0.1.2-alpha.4");
         let transaction = UpdateTransaction {
             phase: "old-moved".to_owned(),
             target: paths.npm_prefix.clone(),
@@ -3559,6 +3698,7 @@ mod tests {
         let stage = paths.updates.join("stage");
         fs::create_dir_all(&stage).unwrap();
         fs::write(stage.join("new.txt"), "new").unwrap();
+        write_test_package(&stage, "0.1.2-alpha.4");
         let transaction = UpdateTransaction {
             phase: "prepared".to_owned(),
             target: paths.npm_prefix.clone(),
@@ -3587,6 +3727,7 @@ mod tests {
         let paths = test_paths(&base);
         paths.ensure_layout().unwrap();
         fs::write(paths.npm_prefix.join("broken.txt"), "broken").unwrap();
+        write_test_package(&paths.npm_prefix, "0.1.2-alpha.4");
         let backup = paths.updates.join("rollback");
         fs::create_dir_all(&backup).unwrap();
         fs::write(backup.join("old.txt"), "old").unwrap();
@@ -3621,6 +3762,7 @@ mod tests {
         fs::create_dir_all(&stage).unwrap();
         fs::create_dir_all(&old).unwrap();
         fs::write(stage.join("new.txt"), "new").unwrap();
+        write_test_package(&stage, "0.1.2-alpha.4");
         fs::write(old.join("old.txt"), "old").unwrap();
         fs::write(paths.transaction_file(), "{").unwrap();
 
@@ -3632,6 +3774,180 @@ mod tests {
         );
         assert!(!old.exists());
         assert!(!paths.transaction_file().exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn authentication_survives_large_and_multibyte_logs_and_rotation() {
+        let base = env::temp_dir().join(format!("dsh-auth-growth-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let log = paths.logs.join("dsh.out.log");
+        let auth = "http://127.0.0.1:3080/?token=first";
+        let probe = || {
+            probe_dsh_with(&paths, |url| {
+                if url == WEB_URL {
+                    ProbeResponse::AuthenticationRequired
+                } else if url == auth {
+                    ProbeResponse::Ready
+                } else {
+                    ProbeResponse::NotDsh
+                }
+            })
+        };
+        fs::write(&log, format!("dsh web: {auth}\n")).unwrap();
+        assert_eq!(probe().web_url.as_deref(), Some(auth));
+        let mut file = OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all("中文日志\n".repeat(2000).as_bytes())
+            .unwrap();
+        drop(file);
+        assert_eq!(probe().web_url.as_deref(), Some(auth));
+        // A fresh log forces a scan without the previously cached address.
+        fs::rename(&log, paths.logs.join("dsh.out.log.1")).unwrap();
+        fs::write(&log, format!("{}\ndsh web: {auth}\n", "中".repeat(3000))).unwrap();
+        assert_eq!(probe().web_url.as_deref(), Some(auth));
+        // Truncation must discard the previous process's URL.
+        fs::write(&log, "new process starting\n").unwrap();
+        assert_eq!(probe().web_url, None);
+        let mut file = OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(b"dsh web: http://127.0.0.1:3080/?tok")
+            .unwrap();
+        assert_eq!(logged_web_url(&paths), None);
+        file.write_all(b"en=second\n").unwrap();
+        drop(file);
+        assert_eq!(
+            logged_web_url(&paths).as_deref(),
+            Some("http://127.0.0.1:3080/?token=second")
+        );
+        assert_eq!(probe().web_url, None); // stale/invalid URLs are still revalidated
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn authenticated_service_reports_actionable_unavailable_status() {
+        let mut value = snapshot(true, true, true, true);
+        value.healthy = false;
+        value.auth_unavailable = true;
+        assert!(status_for_snapshot(&value).contains("认证 URL 不可用"));
+        assert_eq!(main_button(&value, false, false), MainButton::Stop);
+    }
+
+    #[test]
+    fn missing_candidate_enters_repair_instead_of_committing_empty_target() {
+        let base = env::temp_dir().join(format!("dsh-missing-candidate-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let backup = paths.updates.join("dsh-old-1");
+        write_test_package(&backup, "0.1.1");
+        write_transaction(
+            &paths,
+            &UpdateTransaction {
+                phase: "old-moved".to_owned(),
+                target: paths.npm_prefix.clone(),
+                backup: Some(backup.clone()),
+                stage: paths.updates.join("dsh-stage-missing"),
+                profile: ProfileMode::User,
+            },
+        )
+        .unwrap();
+        paths.ensure_layout().unwrap();
+        assert!(recover_update_transaction(&paths).is_err());
+        assert!(paths.repair_file().is_file());
+        assert!(!paths.transaction_file().exists());
+        assert!(backup.exists());
+        assert_eq!(read_profile_mode(&paths), Some(ProfileMode::User));
+        recover_for_use(&paths).unwrap(); // GUI/upgrade must remain accessible
+        let mut value = snapshot(false, true, true, false);
+        value.repair_needed = paths.repair_file().is_file();
+        assert_eq!(main_button(&value, false, false), MainButton::RepairDsh);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn missing_prepared_stage_does_not_accept_the_old_target() {
+        let base = env::temp_dir().join(format!("dsh-prepared-missing-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        write_test_package(&paths.npm_prefix, "0.1.1");
+        write_transaction(
+            &paths,
+            &UpdateTransaction {
+                phase: "prepared".to_owned(),
+                target: paths.npm_prefix.clone(),
+                backup: Some(paths.updates.join("dsh-old-not-moved")),
+                stage: paths.updates.join("dsh-stage-missing"),
+                profile: ProfileMode::User,
+            },
+        )
+        .unwrap();
+        assert!(recover_update_transaction(&paths).is_err());
+        assert!(paths.repair_file().exists());
+        assert_eq!(
+            recovery_version(&paths.npm_prefix).as_deref(),
+            Some("0.1.1")
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn invalid_orphan_requires_repair_and_a_valid_retry_preserves_profile() {
+        let base = env::temp_dir().join(format!("dsh-invalid-orphan-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        write_profile_mode(&paths, ProfileMode::User).unwrap();
+        write_test_package(&paths.npm_prefix, "0.1.1");
+        let stage = paths.updates.join("dsh-stage-incomplete");
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join("partial.tmp"), "partial").unwrap();
+        fs::write(paths.transaction_file(), "{").unwrap();
+        assert!(recover_update_transaction(&paths).is_err());
+        assert!(paths.repair_file().exists());
+        assert!(!paths.transaction_file().exists());
+        assert_eq!(
+            recovery_version(&paths.npm_prefix).as_deref(),
+            Some("0.1.1")
+        );
+        assert!(!paths.npm_prefix.join("partial.tmp").exists());
+        recover_for_use(&paths).unwrap();
+        write_test_package(&stage, "0.1.2-alpha.4");
+        let profile = update_profile_mode(None, read_profile_mode(&paths));
+        promote_stage(&paths, &stage, profile).unwrap();
+        recover_update_transaction(&paths).unwrap();
+        assert!(!paths.repair_file().exists());
+        assert_eq!(
+            recovery_version(&paths.npm_prefix).as_deref(),
+            Some("0.1.2-alpha.4")
+        );
+        assert_eq!(read_profile_mode(&paths), Some(ProfileMode::User));
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn recovery_checks_dependencies_and_keeps_the_repair_version() {
+        let base = env::temp_dir().join(format!("dsh-recovery-deps-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let stage = paths.updates.join("dsh-stage-incomplete");
+        write_test_package(&stage, "0.1.2-alpha.4");
+        fs::write(stage.join("node_modules/@deepseek-ai/dsh/package.json"),
+            r#"{"name":"@deepseek-ai/dsh","version":"0.1.2-alpha.4","dependencies":{"missing":"1.0.0"}}"#).unwrap();
+        write_transaction(
+            &paths,
+            &UpdateTransaction {
+                phase: "prepared".to_owned(),
+                target: paths.npm_prefix.clone(),
+                backup: None,
+                stage,
+                profile: ProfileMode::User,
+            },
+        )
+        .unwrap();
+        assert!(recover_update_transaction(&paths).is_err());
+        assert_eq!(
+            read_repair_version(&paths).as_deref(),
+            Some("0.1.2-alpha.4")
+        );
+        assert!(!paths.managed_package().exists());
         fs::remove_dir_all(base).unwrap();
     }
 

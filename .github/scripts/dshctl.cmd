@@ -10,7 +10,7 @@ set "DSH_LAUNCHER_OUTPUT=%~dp0data\tmp\dshctl-%RANDOM%-%RANDOM%.txt"
 start "" /wait /b "%~dp0DSH-Launcher.exe" --action "%ACTION%"
 set "CODE=%ERRORLEVEL%"
 if exist "%DSH_LAUNCHER_OUTPUT%" (
-    powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$p=$env:DSH_LAUNCHER_OUTPUT; [Console]::Out.Write((Get-Content -Raw -Encoding UTF8 -LiteralPath $p))"
+    powershell.exe -NoLogo -NoProfile -NonInteractive -Command "$p=$env:DSH_LAUNCHER_OUTPUT; $previous=[Console]::OutputEncoding; try { [Console]::OutputEncoding=New-Object Text.UTF8Encoding($false); [Console]::Out.Write((Get-Content -Raw -Encoding UTF8 -LiteralPath $p)) } finally { [Console]::OutputEncoding=$previous }"
     del /q "%DSH_LAUNCHER_OUTPUT%" >nul 2>nul
 )
 endlocal & exit /b %CODE%

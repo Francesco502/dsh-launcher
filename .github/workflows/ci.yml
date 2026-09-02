@@ -67,6 +67,12 @@ jobs:
       - name: Build MSVC release
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bins
 
+      - name: Verify CLI Chinese output and exit codes
+        shell: pwsh
+        run: |
+          & .github\scripts\test-cli.ps1 -LauncherPath target\x86_64-pc-windows-gnu\release\dsh-launcher.exe
+          & .github\scripts\test-cli.ps1 -LauncherPath target\x86_64-pc-windows-msvc\release\dsh-launcher.exe
+
       - name: Embed application icons
         shell: pwsh
         run: |
