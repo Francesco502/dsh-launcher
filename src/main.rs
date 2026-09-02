@@ -15,7 +15,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM,
+    CloseHandle, GetLastError, SetHandleInformation, ERROR_ALREADY_EXISTS, HANDLE,
+    HANDLE_FLAG_INHERIT, HWND, LPARAM, POINT, RECT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -30,13 +31,13 @@ use windows_sys::Win32::Graphics::Gdi::{
     TRANSPARENT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, MoveFileExW, WriteFile, FILE_ATTRIBUTE_NORMAL,
-    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING,
-    MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
+    CreateFileW, GetDiskFreeSpaceExW, GetFileType, MoveFileExW, WriteFile, FILE_ATTRIBUTE_NORMAL,
+    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_PIPE,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
     AttachConsole, GetConsoleMode, GetStdHandle, WriteConsoleW, ATTACH_PARENT_PROCESS,
-    STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::SS_CENTER;
@@ -750,6 +751,7 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
     command
         .arg(&installation.entry)
         .args(["web", "--no-open", "--host", "127.0.0.1", "--port", "3080"])
+        .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
     if installation.profile == ProfileMode::Portable {
@@ -758,6 +760,7 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
         command.env("DSH_HOME", &paths.profile);
     }
     command.env("TEMP", &paths.temp).env("TMP", &paths.temp);
+    isolate_daemon_stdio()?;
     let child = command
         .spawn()
         .map_err(|error| format!("无法启动 DSH：{error}"))?;
@@ -786,6 +789,22 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
         "DSH 启动超时。日志：{}",
         paths.logs.join("dsh.err.log").display()
     ))
+}
+
+fn isolate_daemon_stdio() -> Result<(), String> {
+    // Rust's Windows spawn inherits other inheritable handles as well as the
+    // selected stdio. A daemon must not retain its CLI caller's pipe endpoints.
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        unsafe {
+            let handle = GetStdHandle(stream);
+            if GetFileType(handle) == FILE_TYPE_PIPE
+                && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) == 0
+            {
+                return Err(format!("无法隔离 CLI 管道：{}", GetLastError()));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn stop_dsh() -> Result<String, String> {
@@ -3949,6 +3968,52 @@ mod tests {
         );
         assert!(!paths.managed_package().exists());
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    // This fixture must exit before its bounded child, matching a CLI-launched daemon.
+    #[allow(clippy::zombie_processes)]
+    fn daemon_pipe_fixture() {
+        if env::var_os("DSH_TEST_DAEMON_PIPE").is_none() {
+            return;
+        }
+        isolate_daemon_stdio().unwrap();
+        hidden_command("cmd.exe")
+            .args(["/d", "/c", "ping -n 5 127.0.0.1 >nul"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+    }
+
+    #[test]
+    fn daemon_does_not_hold_the_callers_output_pipes_open() {
+        let mut child = hidden_command(env::current_exe().unwrap())
+            .args(["--exact", "tests::daemon_pipe_fixture", "--nocapture"])
+            .env("DSH_TEST_DAEMON_PIPE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        for mut stream in [Box::new(stdout) as Box<dyn Read + Send>, Box::new(stderr)] {
+            let sender = sender.clone();
+            thread::spawn(move || {
+                let mut output = Vec::new();
+                stream.read_to_end(&mut output).unwrap();
+                sender.send(()).unwrap();
+            });
+        }
+        assert!(child.wait().unwrap().success());
+        for _ in 0..2 {
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("daemon retained a caller pipe");
+        }
     }
 
     #[test]
