@@ -3443,6 +3443,11 @@ mod tests {
         assert!(stale.identified);
         assert_eq!(stale.web_url, None);
 
+        fs::remove_file(paths.logs.join("dsh.out.log")).unwrap();
+        let missing = probe_dsh_with(&paths, |_url| ProbeResponse::AuthenticationRequired);
+        assert!(missing.identified);
+        assert_eq!(missing.web_url, None);
+
         fs::remove_dir_all(base).unwrap();
     }
 
