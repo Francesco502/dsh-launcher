@@ -57,9 +57,9 @@ if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
 }
 
 $runtimeManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
-if ($runtimeManifest.schema_version -ne 1 -or
+if ($runtimeManifest.schema_version -ne 2 -or
     $runtimeManifest.architecture -ne "x86_64-pc-windows-gnu") {
-    throw "Runtime manifest is not the Windows x64 schema 1 manifest."
+    throw "Runtime manifest is not the Windows x64 schema 2 manifest."
 }
 
 $runnerTemp = if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) { $env:TEMP } else { $env:RUNNER_TEMP }

@@ -52,47 +52,13 @@ $changelog = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'CHANGELOG
     }
 
 $runtimeManifest = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'runtime-manifest.json') | ConvertFrom-Json
-    if ($runtimeManifest.schema_version -ne 1 -or $runtimeManifest.architecture -ne 'x86_64-pc-windows-gnu') {
-        throw "runtime-manifest.json is not the Windows x64 schema 1 manifest."
-    }
-    foreach ($component in @($runtimeManifest.node)) {
-        if ($component.version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
-            $component.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
-            -not ([string]$component.url).EndsWith([string]$component.archive_name)) {
-            throw "runtime-manifest.json contains an invalid runtime component."
-        }
-    }
-    if (-not ([string]$runtimeManifest.node.url).StartsWith('https://nodejs.org/download/release/')) {
-        throw "runtime-manifest.json runtime sources are not fixed to the official hosts."
-    }
-    if ($runtimeManifest.dsh.package -ne '@deepseek-ai/dsh' -or
-        [string]$runtimeManifest.dsh.bootstrap_version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
-        $runtimeManifest.dsh.entry -ne 'lib/bin.js') {
-        throw "runtime-manifest.json contains an invalid DSH package declaration."
-    }
-    if ([string]$runtimeManifest.dsh.registry_url -ne 'https://registry.npmjs.org/@deepseek-ai%2fdsh') {
-        throw "runtime-manifest.json DSH registry URL is not fixed to the official package metadata endpoint."
-    }
-    $peerDependencies = @($runtimeManifest.dsh.peer_dependencies)
-    if (@($peerDependencies | Where-Object {
-            $spec = [string]$_
-            $separator = $spec.LastIndexOf('@')
-            if ($separator -le 0 -or $separator -ge $spec.Length - 1) {
-                return $true
-            }
-            $spec.Substring($separator + 1) -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$'
-        }).Count -ne 0 -or
-        (@($peerDependencies | Sort-Object -Unique).Count -ne $peerDependencies.Count)) {
-        throw 'runtime-manifest.json DSH peer dependencies must be unique exact SemVer package specs.'
-    }
-    if ($runtimeManifest.quota.package -ne '@francescoli/dsh-quota' -or
-        $runtimeManifest.quota.runtime_name -ne 'dsh-quota' -or
-        [string]$runtimeManifest.quota.version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$' -or
-        [string]$runtimeManifest.quota.archive_name -ne "dsh-quota-$($runtimeManifest.quota.version).tgz" -or
-        [string]$runtimeManifest.quota.sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
-        [string]$runtimeManifest.quota.url -notmatch '^https://registry\.npmjs\.org/.+\.tgz$' -or
-        -not ([string]$runtimeManifest.quota.url).EndsWith([string]$runtimeManifest.quota.archive_name)) {
-        throw "runtime-manifest.json quota plugin declaration is invalid."
+    if ($runtimeManifest.schema_version -ne 2 -or
+        $runtimeManifest.architecture -ne 'x86_64-pc-windows-gnu' -or
+        $runtimeManifest.dsh.package -ne '@deepseek-ai/dsh' -or
+        $runtimeManifest.dsh.registry -ne 'https://registry.npmjs.org/' -or
+        $runtimeManifest.dsh.entry -ne 'lib/bin.js' -or
+        $runtimeManifest.node.download_page -ne 'https://nodejs.org/en/download') {
+        throw "runtime-manifest.json is not the Windows x64 schema 2 lightweight manifest."
     }
 
     if (-not [string]::IsNullOrWhiteSpace($ReleaseDirectory)) {
@@ -137,6 +103,14 @@ $runtimeManifest = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'run
             -ChecksumPath (Join-Path $releasePath 'DSH-Launcher-Portable-x64.zip.sha256') `
             -AssetName 'DSH-Launcher-Portable-x64.zip' `
             -AssetPath (Join-Path $releasePath 'DSH-Launcher-Portable-x64.zip')
+        $versionInfo = (Get-Item -LiteralPath (Join-Path $releasePath 'DSH-Launcher.exe')).VersionInfo
+        if ($versionInfo.FileDescription -ne 'DSH启动器' -or
+            $versionInfo.ProductName -ne 'DSH启动器' -or
+            $versionInfo.OriginalFilename -ne 'DSH-Launcher.exe' -or
+            $versionInfo.FileVersion -ne $package.version -or
+            $versionInfo.ProductVersion -ne $package.version) {
+            throw 'DSH-Launcher.exe VERSIONINFO is missing or inconsistent with Cargo metadata.'
+        }
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         $zipPath = Join-Path $releasePath 'DSH-Launcher-Portable-x64.zip'
         $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
@@ -167,7 +141,7 @@ $runtimeManifest = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'run
         finally {
             $archive.Dispose()
         }
-        $lockHash = 'not_applicable'
+        $lockHash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $repositoryRoot 'Cargo.lock')).Hash.ToLowerInvariant()
 
         $manifestPath = Join-Path $releasePath 'release-manifest.json'
         $releaseManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
@@ -220,21 +194,8 @@ $runtimeManifest = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'run
         if ($sbom.spdxVersion -ne 'SPDX-2.3' -or $null -eq $sbom.packages) {
             throw 'SBOM is not a valid SPDX 2.3 document.'
         }
-        foreach ($runtimePackage in @('runtime:Node.js', 'npm:@deepseek-ai/dsh')) {
-            if (-not @($sbom.packages | Where-Object { $_.name -eq $runtimePackage })) {
-                throw "SBOM is missing fixed runtime component: $runtimePackage"
-            }
-        }
-        foreach ($peerSpec in $peerDependencies) {
-            $peerText = [string]$peerSpec
-            $peerSeparator = $peerText.LastIndexOf('@')
-            $peerName = $peerText.Substring(0, $peerSeparator)
-            $peerVersion = $peerText.Substring($peerSeparator + 1)
-            if (@($sbom.packages | Where-Object {
-                    $_.name -eq "npm:$peerName" -and $_.versionInfo -eq $peerVersion
-                }).Count -eq 0) {
-                throw "SBOM is missing fixed DSH peer dependency: $peerText"
-            }
+        if (-not @($sbom.packages | Where-Object { $_.name -eq 'npm:@deepseek-ai/dsh' })) {
+            throw 'SBOM is missing the runtime-selected DSH package declaration.'
         }
         foreach ($cargoPackage in @($metadata.packages)) {
             $sbomCargoName = "cargo:$($cargoPackage.name)"

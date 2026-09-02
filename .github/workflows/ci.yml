@@ -34,7 +34,7 @@ jobs:
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
-          rustup toolchain install 1.97.0 --profile minimal --target x86_64-pc-windows-gnu --component rustfmt --component clippy
+          rustup toolchain install 1.97.0 --profile minimal --target x86_64-pc-windows-gnu --target x86_64-pc-windows-msvc --component rustfmt --component clippy
           rustup run 1.97.0 rustc --version
           rustup run 1.97.0 cargo fmt --version
           rustup run 1.97.0 cargo clippy --version
@@ -61,6 +61,12 @@ jobs:
       - name: Build GNU release
         run: cargo build --locked --release --target x86_64-pc-windows-gnu --bins
 
+      - name: Test MSVC target
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Build MSVC release
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bins
+
       - name: Embed application icons
         shell: pwsh
         run: |
@@ -68,6 +74,19 @@ jobs:
           & "$releaseDir\embed_icon.exe" "$releaseDir\dsh-launcher.exe"
           if ($LASTEXITCODE -ne 0) {
             throw "Icon embedding failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Enforce lightweight source and executable gates
+        shell: pwsh
+        run: |
+          $mainLines = (Get-Content -LiteralPath "src\main.rs").Count
+          if ($mainLines -gt 6500) {
+            throw "src/main.rs has $mainLines lines; the 0.3.1 limit is 6500."
+          }
+          $candidate = Get-Item -LiteralPath "target\x86_64-pc-windows-gnu\release\dsh-launcher.exe"
+          $maxBytes = 1238093
+          if ($candidate.Length -gt $maxBytes) {
+            throw "Release EXE is $($candidate.Length) bytes; the 0.3.0 plus 5 percent limit is $maxBytes bytes."
           }
 
       - name: Prepare portable bundle
@@ -108,3 +127,11 @@ jobs:
             Write-Output "::error title=Portable initialization smoke test failed::$summary"
             throw "Extracted portable bundle initialization smoke test failed with exit code $exitCode."
           }
+
+      - name: Upload portable candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: dsh-launcher-portable-${{ github.sha }}-${{ github.run_attempt }}
+          path: dist/DSH-Launcher-Portable-x64.zip
+          if-no-files-found: error
+          retention-days: 7

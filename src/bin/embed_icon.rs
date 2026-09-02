@@ -10,6 +10,7 @@ use windows_sys::Win32::System::LibraryLoader::{
 
 const RT_ICON: usize = 3;
 const RT_GROUP_ICON: usize = 14;
+const RT_VERSION: usize = 16;
 const ICON_SIZES: [u32; 4] = [16, 32, 48, 256];
 const COLOR_ICON_GROUP_ID: usize = 1;
 const BLACK_ICON_GROUP_ID: usize = 2;
@@ -40,6 +41,7 @@ fn main() {
     }
     let group = make_group_icon(&images, COLOR_ICON_RESOURCE_BASE);
     let black_group = make_group_icon(&black_images, BLACK_ICON_RESOURCE_BASE);
+    let version = make_version_resource(env!("CARGO_PKG_VERSION"));
     let path_wide = to_wide(&path.to_string_lossy());
 
     unsafe {
@@ -92,6 +94,20 @@ fn main() {
             let error = GetLastError();
             EndUpdateResourceW(update, 1);
             panic!("UpdateResourceW(RT_GROUP_ICON) failed: {error}");
+        }
+
+        if UpdateResourceW(
+            update,
+            resource_id(RT_VERSION),
+            resource_id(1),
+            0x0804,
+            version.as_ptr().cast::<c_void>(),
+            version.len() as u32,
+        ) == 0
+        {
+            let error = GetLastError();
+            EndUpdateResourceW(update, 1);
+            panic!("UpdateResourceW(RT_VERSION) failed: {error}");
         }
 
         if UpdateResourceW(
@@ -425,6 +441,106 @@ fn make_group_icon(images: &[Vec<u8>], resource_base: usize) -> Vec<u8> {
     group
 }
 
+fn make_version_resource(version: &str) -> Vec<u8> {
+    let mut numbers = version
+        .split_once('-')
+        .map_or(version, |(stable, _)| stable)
+        .split('.')
+        .map(|part| part.parse::<u16>().expect("Cargo version must be numeric"));
+    let major = numbers.next().expect("Cargo version requires major");
+    let minor = numbers.next().expect("Cargo version requires minor");
+    let patch = numbers.next().expect("Cargo version requires patch");
+
+    let mut fixed = Vec::with_capacity(52);
+    for value in [
+        0xFEEF04BD,
+        0x00010000,
+        (u32::from(major) << 16) | u32::from(minor),
+        u32::from(patch) << 16,
+        (u32::from(major) << 16) | u32::from(minor),
+        u32::from(patch) << 16,
+        0x0000003F,
+        0,
+        0x00040004,
+        1,
+        0,
+        0,
+        0,
+    ] {
+        push_u32(&mut fixed, value);
+    }
+
+    let strings = [
+        ("CompanyName", "Francesco502"),
+        ("FileDescription", "DSH启动器"),
+        ("FileVersion", version),
+        ("InternalName", "DSH-Launcher"),
+        ("LegalCopyright", "MIT License"),
+        ("OriginalFilename", "DSH-Launcher.exe"),
+        ("ProductName", "DSH启动器"),
+        ("ProductVersion", version),
+    ]
+    .into_iter()
+    .map(|(key, value)| {
+        let value = utf16_bytes(value);
+        version_block(key, &value, (value.len() / 2) as u16, 1, &[])
+    })
+    .collect::<Vec<_>>();
+    let string_table = version_block("080404B0", &[], 0, 1, &strings);
+    let string_file_info = version_block("StringFileInfo", &[], 0, 1, &[string_table]);
+
+    let mut translation = Vec::with_capacity(4);
+    push_u16(&mut translation, 0x0804);
+    push_u16(&mut translation, 1200);
+    let translation = version_block("Translation", &translation, 4, 0, &[]);
+    let var_file_info = version_block("VarFileInfo", &[], 0, 1, &[translation]);
+
+    version_block(
+        "VS_VERSION_INFO",
+        &fixed,
+        fixed.len() as u16,
+        0,
+        &[string_file_info, var_file_info],
+    )
+}
+
+fn version_block(
+    key: &str,
+    value: &[u8],
+    value_length: u16,
+    value_type: u16,
+    children: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut block = Vec::new();
+    push_u16(&mut block, 0);
+    push_u16(&mut block, value_length);
+    push_u16(&mut block, value_type);
+    block.extend_from_slice(&utf16_bytes(key));
+    align_dword(&mut block);
+    block.extend_from_slice(value);
+    align_dword(&mut block);
+    for child in children {
+        block.extend_from_slice(child);
+    }
+    let length = u16::try_from(block.len()).expect("version resource block too large");
+    block[0..2].copy_from_slice(&length.to_le_bytes());
+    block
+}
+
+fn utf16_bytes(value: &str) -> Vec<u8> {
+    value
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+fn align_dword(output: &mut Vec<u8>) {
+    while !output.len().is_multiple_of(4) {
+        output.push(0);
+    }
+}
+
 fn resource_id(id: usize) -> *const u16 {
     id as *const u16
 }
@@ -496,5 +612,19 @@ mod tests {
             }
         }
         assert!(visible_pixel_found);
+    }
+
+    #[test]
+    fn version_resource_contains_windows_product_identity() {
+        let version = make_version_resource("0.3.1");
+        let text = String::from_utf16_lossy(
+            &version
+                .chunks_exact(2)
+                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .collect::<Vec<_>>(),
+        );
+        assert!(text.contains("DSH启动器"));
+        assert!(text.contains("DSH-Launcher.exe"));
+        assert!(version.starts_with(&(version.len() as u16).to_le_bytes()));
     }
 }

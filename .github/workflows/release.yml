@@ -38,7 +38,7 @@ jobs:
       - name: Install pinned Rust toolchain
         shell: pwsh
         run: |
-          rustup toolchain install 1.97.0 --profile minimal --target x86_64-pc-windows-gnu --component rustfmt --component clippy
+          rustup toolchain install 1.97.0 --profile minimal --target x86_64-pc-windows-gnu --target x86_64-pc-windows-msvc --component rustfmt --component clippy
           rustup run 1.97.0 rustc --version
           rustup run 1.97.0 cargo fmt --version
           rustup run 1.97.0 cargo clippy --version
@@ -57,6 +57,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
+      - name: Test Windows MSVC target
+        run: cargo test --locked --target x86_64-pc-windows-msvc
+
+      - name: Build Windows MSVC target
+        run: cargo build --locked --release --target x86_64-pc-windows-msvc --bins
+
       - name: Build Windows release
         run: cargo build --locked --release --target x86_64-pc-windows-gnu --bins
 
@@ -65,6 +71,19 @@ jobs:
         run: |
           $releaseDir = "target\x86_64-pc-windows-gnu\release"
           & "$releaseDir\embed_icon.exe" "$releaseDir\dsh-launcher.exe"
+
+      - name: Enforce lightweight source and executable gates
+        shell: pwsh
+        run: |
+          $mainLines = (Get-Content -LiteralPath "src\main.rs").Count
+          if ($mainLines -gt 6500) {
+            throw "src/main.rs has $mainLines lines; the 0.3.1 limit is 6500."
+          }
+          $candidate = Get-Item -LiteralPath "target\x86_64-pc-windows-gnu\release\dsh-launcher.exe"
+          $maxBytes = 1238093
+          if ($candidate.Length -gt $maxBytes) {
+            throw "Release EXE is $($candidate.Length) bytes; the 0.3.0 plus 5 percent limit is $maxBytes bytes."
+          }
 
       - name: Prepare portable Windows bundle
         shell: pwsh
@@ -141,6 +160,7 @@ jobs:
           }
           $sbomHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $sbomPath).Hash.ToLowerInvariant()
           $runtimeManifestHash = (Get-FileHash -Algorithm SHA256 -LiteralPath "runtime-manifest.json").Hash.ToLowerInvariant()
+          $dependencyLockHash = (Get-FileHash -Algorithm SHA256 -LiteralPath "Cargo.lock").Hash.ToLowerInvariant()
           $tagVersion = $env:GITHUB_REF_NAME.Substring(1)
           $manifest = [ordered]@{
             schema_version = 1
@@ -152,7 +172,7 @@ jobs:
             architecture = "x86_64"
             authenticode_status = "unsigned"
             runtime_manifest_sha256 = $runtimeManifestHash
-            dependency_lock_sha256 = "not_applicable"
+            dependency_lock_sha256 = $dependencyLockHash
             manifest_self_hash = "excluded_to_avoid_self_reference"
             assets = @(
               [ordered]@{
@@ -224,7 +244,7 @@ jobs:
             draft = $true
             prerelease = $false
             generate_release_notes = $false
-            body = "DSH Launcher $env:GITHUB_REF_NAME. This Windows x64 release is unsigned (authenticode_status: unsigned). DSH-Launcher-Portable-x64.zip is the lightweight launcher package; the first runtime repair requires network access to download and verify Node.js and DSH. DSH-Launcher.exe is the technical self-update asset."
+            body = "DSH Launcher $env:GITHUB_REF_NAME. This Windows x64 release is unsigned (authenticode_status: unsigned). DSH-Launcher-Portable-x64.zip is the supported lightweight package. It contains no Node.js or DSH runtime. Install Node.js separately when absent; DSH install and update are explicit user actions. DSH-Launcher.exe is a technical asset and is not a standalone portable package."
           }
           $existing = @(
             Invoke-RestMethod -Method Get -Uri "${releaseApi}?per_page=100" -Headers $headers |

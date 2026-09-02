@@ -23,7 +23,6 @@ if ($null -eq $application) {
 }
 $applicationVersion = [string]$application.version
 $runtimeManifest = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot "runtime-manifest.json") | ConvertFrom-Json
-$peerDependencies = @($runtimeManifest.dsh.peer_dependencies)
 
 $packages = @()
 foreach ($package in @($metadata.packages)) {
@@ -36,60 +35,12 @@ foreach ($package in @($metadata.packages)) {
     }
 }
 
-foreach ($component in @(
-    [ordered]@{
-        id = "nodejs-$($runtimeManifest.node.version)"
-        name = "runtime:Node.js"
-        version = [string]$runtimeManifest.node.version
-        location = [string]$runtimeManifest.node.url
-        sha256 = [string]$runtimeManifest.node.sha256
-    },
-    [ordered]@{
-        id = "dsh-$($runtimeManifest.dsh.bootstrap_version)"
-        name = "npm:$($runtimeManifest.dsh.package)"
-        version = [string]$runtimeManifest.dsh.bootstrap_version
-        location = [string]$runtimeManifest.dsh.registry_url
-        sha256 = $null
-    },
-    [ordered]@{
-        id = "dsh-quota-$($runtimeManifest.quota.version)"
-        name = "npm:$($runtimeManifest.quota.package)"
-        version = [string]$runtimeManifest.quota.version
-        location = [string]$runtimeManifest.quota.url
-        sha256 = [string]$runtimeManifest.quota.sha256
-    }
-)) {
-    $packages += [ordered]@{
-        SPDXID = New-SpdxId "runtime-$($component.id)"
-        name = $component.name
-        versionInfo = $component.version
-        downloadLocation = $component.location
-        filesAnalyzed = $false
-        checksums = if ($component.sha256) {
-            @(
-                [ordered]@{
-                    algorithm = "SHA256"
-                    checksumValue = $component.sha256
-                }
-            )
-        } else { @() }
-    }
-}
-
-foreach ($spec in $peerDependencies) {
-    $separator = ([string]$spec).LastIndexOf('@')
-    if ($separator -le 0 -or $separator -ge ([string]$spec).Length - 1) {
-        throw "Invalid fixed DSH peer dependency spec: $spec"
-    }
-    $peerName = ([string]$spec).Substring(0, $separator)
-    $peerVersion = ([string]$spec).Substring($separator + 1)
-    $packages += [ordered]@{
-        SPDXID = New-SpdxId "npm-peer-$spec"
-        name = "npm:$peerName"
-        versionInfo = $peerVersion
-        downloadLocation = "https://registry.npmjs.org/$([uri]::EscapeDataString($peerName))"
-        filesAnalyzed = $false
-    }
+$packages += [ordered]@{
+    SPDXID = New-SpdxId "runtime-dsh-selected-at-install-time"
+    name = "npm:$($runtimeManifest.dsh.package)"
+    versionInfo = "selected-at-install-time"
+    downloadLocation = [string]$runtimeManifest.dsh.registry
+    filesAnalyzed = $false
 }
 
 $manifest = [ordered]@{

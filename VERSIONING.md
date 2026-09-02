@@ -25,6 +25,7 @@ cargo metadata --locked --no-deps --format-version 1
 - `PATCH`：向后兼容的修复、稳定性改进、安全修复或兼容性修正。
 - 仅文档、测试或内部重构且不改变发布物时，不强制创建版本；若需要对外发布，仍必须按完整流程递增版本。
 - 当前启动器更新逻辑和发布工作流只支持稳定版三段式版本号。`-alpha`、`-beta`、`-rc` 等预发布版本在另行实现解析和更新策略前禁止使用。
+- `0.3.1` 是一次明确限定范围的 0.x 版本例外：它收缩公开 CLI 和主窗口工作流。该例外只适用于本版本，必须在变更记录中完整列出删除的入口，后续版本仍遵循本节规则。
 
 版本号一旦发布即不可重用。禁止移动、覆盖或强制推送已经公开的版本标签；需要修复时创建下一个版本。
 
@@ -45,8 +46,8 @@ cargo metadata --locked --no-deps --format-version 1
 2. `Cargo.toml`、`Cargo.lock`、`CHANGELOG.md` 和标签版本一致。
 3. `cargo fmt --check --all` 通过。
 4. `cargo test --locked` 和 `cargo clippy --locked --all-targets -- -D warnings` 通过。
-5. Windows GNU release build 通过，`embed_icon.exe` 已把官方蓝色和黑色鲸鱼图标写入最终 EXE。
-6. 轻量主 ZIP 通过顶层目录、`portable.flag`、无用户数据/凭据、SHA-256 和 SPDX SBOM 检查；主 ZIP 不得包含运行时目录，首次运行由用户在线执行运行时修复。
+5. Windows GNU 与 MSVC 的测试和 release build 均通过；`embed_icon.exe` 已把官方蓝色/黑色鲸鱼图标及与 Cargo 版本一致的 Windows VERSIONINFO 写入最终 GNU EXE。
+6. 轻量主 ZIP 通过顶层目录、`portable.flag`、无用户数据/凭据、SHA-256 和 SPDX SBOM 检查；主 ZIP 不得包含运行时目录。普通启动只能本地发现 DSH，联网安装或更新 DSH 必须由用户明确触发，启动器不得下载 Node.js。
 7. `.github\scripts\validate-release.ps1 -Tag vX.Y.Z -ReleaseDirectory dist` 通过。
 
 发布门禁由 `.github/workflows/release.yml` 在 GitHub Actions 上重复执行；本地通过不能替代远程构建结果。
@@ -70,7 +71,7 @@ cargo metadata --locked --no-deps --format-version 1
 7. 标签推送触发 `.github/workflows/release.yml`。工作流会重新验证版本、测试、构建、嵌入图标、生成资产和 SPDX SBOM。
 8. 工作流先创建草稿 Release，上传六个公开资产，重新下载并校验每个资产的哈希和 ZIP 内容，随后才把草稿转为公开状态；任一步失败都不会公开。
 9. 发布后检查 Release 为非草稿状态，资产名称完整，manifest 中的提交、版本、运行时清单摘要、依赖锁摘要和 SHA-256 与本次构建相符。
-10. 下载 `DSH-Launcher.exe` 并按 `.sha256` 校验；自更新功能只能使用官方仓库 Release 的固定技术资产。
+10. 下载 `DSH-Launcher.exe` 并按 `.sha256` 校验；应用内只检查版本并跳转 Release，不允许自动下载或替换启动器。
 
 工作流失败时，不得跳过门禁手工上传未知构建物。修复后应使用新的 PATCH 版本；已经创建的标签或 Release 不得复用。
 
@@ -85,7 +86,7 @@ cargo metadata --locked --no-deps --format-version 1
 | `DSH-Launcher-Portable-x64.zip` | 轻量 Windows x64 主便携包，仅包含启动器、发布契约和 `portable.flag` |
 | `DSH-Launcher-Portable-x64.zip.sha256` | 便携包 ZIP 的 SHA-256 |
 | `release-manifest.json` | 机器可读的版本、提交、目标平台和资产校验信息 |
-| `sbom.spdx.json` | SPDX 2.3 的 Rust 与按需下载运行时依赖清单 |
+| `sbom.spdx.json` | SPDX 2.3 的 Rust 依赖与运行时选择的官方 DSH 包声明 |
 
 Release manifest 必须包含 `authenticode_status: "unsigned"`。`release-manifest.json` 本身不放入自己的 `assets` 哈希数组，因为这样会形成自引用；其余五个资产必须逐一列出并校验。正式 Release 的 `commit` 必须是标签提交的 40 位 SHA；未提交工作树只能在本地显式验证模式下使用 `local-working-tree` 占位值。
 
@@ -102,7 +103,7 @@ Release manifest 必须包含 `authenticode_status: "unsigned"`。`release-manif
   "architecture": "x86_64",
   "authenticode_status": "unsigned",
   "runtime_manifest_sha256": "<runtime-manifest-hash>",
-  "dependency_lock_sha256": "not_applicable",
+  "dependency_lock_sha256": "<cargo-lock-sha256>",
   "assets": [
     { "name": "DSH-Launcher.exe", "sha256": "<hash>", "type": "application/vnd.microsoft.portable-executable" },
     { "name": "DSH-Launcher.exe.sha256", "sha256": "<hash>", "type": "text/plain" },

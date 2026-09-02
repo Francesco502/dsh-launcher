@@ -1,37 +1,62 @@
 # DSH启动器
 
-`dsh-launcher.exe` 是面向 Windows 的原生“DSH启动器”。
+`DSH-Launcher.exe` 是 Windows 10/11 x64 的轻量原生 DSH 启动器。0.3.1 只保留启动/停止、打开 Web UI 和手动更新 DSH；普通启动只检查本机，不联网。
 
-当前应用版本以 `Cargo.toml` 的 `[package].version` 为唯一来源；版本和发布规则见 [`VERSIONING.md`](VERSIONING.md)，变更记录见 [`CHANGELOG.md`](CHANGELOG.md)。
+## 使用
 
-This project targets local DSH lifecycle management: install/update, start, restart, stop, and open the Web UI. Version 0.2.1 ships as a lightweight Windows x64 portable launcher for Windows 10/11; the runtime is installed on demand when the user chooses `验证并修复运行时`.
+下载并完整解压 `DSH-Launcher-Portable-x64.zip`，然后运行 `DSH-Launcher.exe`。`portable.flag` 和 `runtime-manifest.json` 必须与 EXE 同目录，启动器管理的数据固定写入同目录的 `data`。若把完整目录放在 D 盘，DSH 管理副本、配置、缓存、日志和更新暂存也会留在 D 盘。
 
-## Main window
+首页最多显示三个操作按钮：
 
-Launching the executable opens a visible `DSH启动器` window with these actions:
+- 主按钮按状态显示“启动 DSH”“停止 DSH”“安装 DSH”“重新安装 DSH”或“安装 Node.js”；只有下载和预检阶段显示“取消”。
+- “打开 Web UI”仅在已验证为 DSH 页面且 Web 服务健康时可用。
+- “更新 DSH”仅在已发现 DSH 且 npm 可用时显示并启用。
 
-- 启动 dsh
-- 重启 dsh
-- 关闭 dsh
-- 更新 dsh
-- 打开 Web UI
-- 打开数据目录
-- 验证并修复运行时
-- 诊断详情、取消和退出
+页脚“检查启动器更新”只比较 GitHub Release 版本；发现新版后打开官方 Release 页面，不下载或替换当前 EXE。托盘固定为“打开面板”“启动/停止 DSH”“打开 Web UI”“退出”。窗口关闭时立即隐藏并以非阻塞系统通知说明托盘操作；隐藏后停止 15 秒健康检查，不会周期运行 `netstat.exe`。
 
-Closing the window keeps the launcher in the notification area. The first close explains this behavior; launching the executable again restores the existing window instead of silently exiting. The tray menu exposes service actions, `打开 Web UI`, `打开数据目录`, `更新 DSH`, `更新启动器`, `移入旧数据回收站`, and exit. The Web UI health state refreshes every five seconds while the launcher is open, and the tray icon is recreated after Explorer restarts.
+## 本机发现与首次安装
 
-The launcher uses native Win32 controls, a path-scoped single-instance mutex, and worker threads for long-running actions. The same executable directory remains single-instance, while separate portable copies can run side by side during migration or acceptance testing. It does not open a console window for DSH or upgrade commands. `--action` command-line mode attaches to a caller console and rebinds input, output, and error streams; normal launch without arguments remains a windowed application. The main panel supports Tab, Enter, Space, Esc, visible focus, high contrast, light/dark system themes, and 100%/150%/200% DPI changes.
+发现顺序是：
 
-The data root is strict: a normal launch requires `portable.flag` and `runtime-manifest.json` beside the EXE; the writable `data` directory is created there on first launch. There is no `%LOCALAPPDATA%` fallback, environment-variable fallback, or scan of other drives. `--data-dir` remains only as a compatibility parser and is rejected unless it resolves to that exact sibling `data` directory. Therefore, putting the complete directory under `D:\Apps\DSH-Launcher` keeps runtime, npm packages/cache, profile, logs, state, updates, and temporary files on D:. If the directory is on the system drive, the main window warns the user to stop DSH and move the whole directory to D:. The operating system may still write its own Prefetch or event data outside the application root.
+1. `data\npm-global` 中的启动器管理 DSH。
+2. 当前 Windows 用户 npm 全局目录中的系统 DSH。
 
-The `DSH-Launcher-Portable-x64.zip` deliberately contains no Node.js, PowerShell 7, or DSH package. It launches immediately and keeps the download small; the first `验证并修复运行时` action downloads and verifies Node.js and DSH into `data\updates` before promotion. Windows 10/11 system `powershell.exe` is used for the small launcher-side download and archive operations, so PowerShell 7 is not duplicated in the package. A disconnected first-run installation is not supported because no offline runtime archive is distributed; prepare the runtime while connected, then move the complete portable directory if offline use is required. Do not run the launcher as Administrator: it intentionally uses the current user's DSH profile.
+启动器复用本机 `node.exe` 和 `npm.cmd`，不下载、校验或解压 Node.js。缺少 Node.js 时只打开 [Node.js 官方下载页](https://nodejs.org/en/download)。有 Node.js/npm 但没有 DSH 时，用户确认确切版本和目标路径后，启动器才从官方 npm registry 安装到 `data\npm-global`。
 
-The launcher can stop a DSH service started by the launcher or by another local method only after verifying that the `3080` listener's command line contains the DSH package entry point and the `web` command. An explicit `--port` argument must match `3080`; omitting it is accepted because the verified process is the listener on `3080`. It refuses to terminate an unverified process. If port `3080` is occupied by another service, release it before starting the Windows-native service. The GUI can offer a transactional copy of old `%LOCALAPPDATA%\DSH-Runtime`, `%LOCALAPPDATA%\npm-global`, and `%USERPROFILE%\.dsh` data; each file is checked by size and SHA-256, failures roll back the target, and the old source is never auto-deleted.
+系统 DSH 直接使用当前 Windows 用户配置。由启动器首次安装的 DSH 使用 `data\profile`。系统 DSH 更新为启动器管理副本时不会修改系统安装，并继续使用 Windows 用户配置。
 
-DSH stdout and stderr are retained in `<data-root>\logs\dsh-launcher-native.out.log` and `dsh-launcher-native.err.log`; logs rotate by type at five files of 5 MiB each. A launch failure reports the stage, log path, and final diagnostic lines. The upgrade action compares every version published in the official npm package metadata using full SemVer, including prereleases not assigned to the `latest` dist-tag, and refuses downgrade. It installs the exact candidate with a lockfile, blocks high/critical npm audit findings, starts it on port `3081`, and checks both the Web UI and `dsh-quota` JSON endpoint. Only that already-verified directory replaces the data-root package. A failed promotion or restart restores the prior version and, when needed, restarts the prior service.
+## DSH 手动更新
 
-## Build
+“更新 DSH”读取官方包的全部版本并按完整 SemVer 比较，因此会识别未进入 `latest` 标签的预发布版本，例如 `0.1.2-alpha.4`，且不会降级。
+
+候选版本使用以下约束安装到同盘 `data\updates`：
+
+```text
+--ignore-scripts --omit=dev --no-audit --no-fund
+```
+
+启动器校验包名、精确版本、`lib/bin.js` 和全部直接运行依赖后，交换完整的管理 npm 前缀。更新前运行中的 DSH 会在提交前停止；提交成功后固定保留最新版本，即使启动失败也不会降级。启动失败时主按钮允许重新安装同一最新版。短暂隔离的旧目录只会被清理，崩溃恢复也不会重新启用旧版本。
+
+对于要求 Web 认证的 DSH 版本，启动器读取并重新验证 DSH 自己输出的本地认证地址用于健康检查和“打开 Web UI”，但状态栏、托盘和通知不会显示认证令牌。普通占用 3080 端口的 HTTP 程序不会被识别为 DSH。
+
+下载前要求更新盘至少有 512 MiB 可用空间。npm 缓存、更新暂存和命令临时文件都位于便携目录；缓存会在查询或安装后清空。
+
+DSH 输出位于 `data\logs\dsh.out.log` 和 `data\logs\dsh.err.log`，每类最多五个 5 MiB 文件。错误对话框显示摘要和日志路径，可按 Ctrl+C 复制详情。
+
+## CLI
+
+公开命令仅有：
+
+```powershell
+DSH-Launcher.exe --action start
+DSH-Launcher.exe --action stop
+DSH-Launcher.exe --action upgrade
+DSH-Launcher.exe --action open
+```
+
+ZIP 内的 `dshctl.cmd` 提供相同的四个动作，阻塞等待完成、输出中文结果并返回退出码。0.3.1 不再接受 `restart`、`repair`、`migrate`、`launcher-update`、`data`、`--data-dir` 或自更新内部参数。
+
+## 构建与发布门禁
 
 ```powershell
 cargo fmt --check --all --manifest-path Cargo.toml
@@ -41,23 +66,8 @@ cargo build --locked --release --manifest-path Cargo.toml --target x86_64-pc-win
 target\x86_64-pc-windows-gnu\release\embed_icon.exe target\x86_64-pc-windows-gnu\release\dsh-launcher.exe
 ```
 
-The release executable is:
+图标嵌入器把 DeepSeek 官方鲸鱼标志和 Windows VERSIONINFO 写入 EXE：DSH 健康时使用官方蓝色 `#4D6BFE`，停止、不可用或异常时使用黑色。界面使用适配简体中文的 `Microsoft YaHei UI`，并保留 DPI、高对比度、键盘焦点和 Explorer 重启后的托盘恢复。
 
-`target\x86_64-pc-windows-gnu\release\dsh-launcher.exe`
+Release 固定发布六个资产：EXE、EXE SHA-256、便携 ZIP、ZIP SHA-256、`release-manifest.json` 和 Rust SPDX SBOM。发布物未签名并明确记录 `authenticode_status: unsigned`。技术型单独 EXE 不作为完整便携包使用。
 
-The release output is not copied to the desktop automatically; choose any writable directory, preferably on the data drive.
-
-The icon embedder writes the official DeepSeek whale mark as custom multi-size blue and black icons into the release executable. The tray icon uses DeepSeek blue (`#4D6BFE`) while DSH is healthy and switches to the black whale mark (`#000000`) when DSH is unavailable, stopped, or unhealthy. The `--action start|restart|stop|upgrade|launcher-update|repair|migrate|open|data` command-line modes are included for automation and verification; normal launch without arguments opens the main window.
-
-Command-line actions accept `--data-dir D:\path\to\data` only when it is the exact sibling data directory. The `DSH-Launcher-Portable-x64.zip` Release asset is the supported lightweight cross-device package; extract it as a complete directory and keep `portable.flag` and `runtime-manifest.json` beside the EXE. After the first connected runtime repair, the complete portable directory can be moved to another device; no separate runtime archive is distributed.
-
-## 启动器自身更新
-
-托盘菜单中的 `更新启动器` 会读取本项目的公开 GitHub Release。只有 Release 版本严格高于当前版本时才会执行更新；程序会下载并校验以下两个固定资产：
-
-- `DSH-Launcher.exe`
-- `DSH-Launcher.exe.sha256`
-
-校验通过后，启动器把更新暂存到便携 `data\updates`，记录父进程、事务令牌、目标路径和旧哈希，复制自身为更新助手，退出当前进程，由助手以同盘原子替换并保留按事务命名的备份；新版本必须完成窗口、托盘、数据清单初始化并写入健康握手，助手才删除备份。恢复、删除或清理失败会返回真实错误。网络失败、版本不高或 SHA-256 不匹配都不会修改当前 EXE。命令行等价入口为 `--action launcher-update`。
-
-推送符合 `vMAJOR.MINOR.PATCH` 的标签会触发 `.github/workflows/release.yml`：它执行版本、格式、Clippy、测试、Windows x64 release build、图标资源、轻量 ZIP 白名单、SBOM 和 manifest 门禁，先创建草稿 Release，重新下载并校验全部资产后才公开。公开资产为 `DSH-Launcher.exe`、两个校验文件、`DSH-Launcher-Portable-x64.zip`、`release-manifest.json` 和 `sbom.spdx.json`，并明确标注未签名。应用能够更新到后续启动器 Release，但不会把 DSH 包更新误认为启动器更新。
+版本与发布规则见 [VERSIONING.md](VERSIONING.md)，变更记录见 [CHANGELOG.md](CHANGELOG.md)。
