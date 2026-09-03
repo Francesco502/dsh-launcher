@@ -106,6 +106,7 @@ const UPDATE_REQUIRED_FREE_SPACE: u64 = 512 * 1024 * 1024;
 const DSH_HTML_MARKER: &str = "__DSH_BOOT__";
 const DSH_AUTH_MARKER: &str = "dsh web authentication required";
 const CLI_OUTPUT_ENV: &str = "DSH_LAUNCHER_OUTPUT";
+const BROWSER_ENTRY: &[u8] = include_bytes!("browser_entry.cjs");
 
 const ICON_BLUE: usize = 1;
 const ICON_BLACK: usize = 2;
@@ -749,8 +750,15 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
         .append(true)
         .open(paths.logs.join("dsh.err.log"))
         .map_err(|error| format!("无法打开 DSH 错误日志：{error}"))?;
+    let browser_entry = paths.state.join("browser-entry.cjs");
+    if fs::read(&browser_entry).ok().as_deref() != Some(BROWSER_ENTRY) {
+        fs::write(&browser_entry, BROWSER_ENTRY)
+            .map_err(|error| format!("无法准备浏览器本机入口：{error}"))?;
+    }
     let mut command = hidden_command(&installation.node);
     command
+        .arg("--require")
+        .arg(&browser_entry)
         .arg(&installation.entry)
         .args(["web", "--no-open", "--host", "127.0.0.1", "--port", "3080"])
         .stdin(Stdio::null())
