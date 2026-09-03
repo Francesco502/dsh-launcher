@@ -51,7 +51,9 @@ use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, VK_ESCAPE};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, IsWindowEnabled, VK_ESCAPE, VK_RETURN,
+};
 use windows_sys::Win32::UI::Shell::{
     IsUserAnAdmin, SetCurrentProcessExplicitAppUserModelID, ShellExecuteW, Shell_NotifyIconW,
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -64,14 +66,14 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     LoadIconW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
     SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TrackPopupMenu,
-    TranslateMessage, BS_OWNERDRAW, CREATESTRUCTW, EVENT_OBJECT_NAMECHANGE, GWLP_USERDATA, HICON,
-    ICON_BIG, ICON_SMALL, ICON_SMALL2, IDC_ARROW, IDYES, MB_ICONERROR, MB_ICONINFORMATION,
-    MB_ICONQUESTION, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, OBJID_CLIENT,
-    SPI_GETHIGHCONTRAST, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
-    TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
-    WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_PAINT, WM_RBUTTONUP, WM_SETFONT,
-    WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
+    TranslateMessage, BM_CLICK, BS_OWNERDRAW, CREATESTRUCTW, EVENT_OBJECT_NAMECHANGE,
+    GWLP_USERDATA, HICON, ICON_BIG, ICON_SMALL, ICON_SMALL2, IDC_ARROW, IDYES, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
+    OBJID_CLIENT, SPI_GETHIGHCONTRAST, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_PAINT, WM_RBUTTONUP,
+    WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
     WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
     WS_VISIBLE,
 };
@@ -2277,6 +2279,21 @@ unsafe fn create_main_window(hinstance: *mut c_void, state: Arc<AppState>) -> Re
     ShowWindow(hwnd, SW_SHOW);
     let mut message = MSG::default();
     while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+        // Owner-drawn buttons do not provide the default-button dialog code.
+        // Activate the focused launcher button explicitly for Enter, while
+        // leaving Space and Tab to the native button/dialog handling.
+        if message.message == WM_KEYDOWN && message.wParam == VK_RETURN as usize {
+            let id = GetDlgCtrlID(message.hwnd) as u32;
+            if matches!(id, CMD_MAIN | CMD_WEB | CMD_UPDATE_DSH | CMD_CHECK_LAUNCHER)
+                && message.hwnd == GetDlgItem(hwnd, id as i32)
+                && IsWindowEnabled(message.hwnd) != 0
+            {
+                if message.lParam & (1 << 30) == 0 {
+                    SendMessageW(message.hwnd, BM_CLICK, 0, 0);
+                }
+                continue;
+            }
+        }
         if IsDialogMessageW(hwnd, &message) == 0 {
             TranslateMessage(&message);
             DispatchMessageW(&message);
