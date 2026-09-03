@@ -52,7 +52,7 @@ use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, IsWindowEnabled, VK_ESCAPE, VK_RETURN,
+    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, VK_ESCAPE, VK_RETURN,
 };
 use windows_sys::Win32::UI::Shell::{
     IsUserAnAdmin, SetCurrentProcessExplicitAppUserModelID, ShellExecuteW, Shell_NotifyIconW,
@@ -62,20 +62,20 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, FindWindowW, GetClientRect, GetCursorPos, GetDlgCtrlID, GetDlgItem,
-    GetMessageW, GetWindowLongPtrW, IsDialogMessageW, IsWindowVisible, KillTimer, LoadCursorW,
-    LoadIconW, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW, TrackPopupMenu,
-    TranslateMessage, BM_CLICK, BS_OWNERDRAW, CREATESTRUCTW, EVENT_OBJECT_NAMECHANGE,
-    GWLP_USERDATA, HICON, ICON_BIG, ICON_SMALL, ICON_SMALL2, IDC_ARROW, IDYES, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
-    OBJID_CLIENT, SPI_GETHIGHCONTRAST, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOW,
-    SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NULL, WM_PAINT, WM_RBUTTONUP,
-    WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
-    WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, IsDialogMessageW, IsWindowVisible,
+    KillTimer, LoadCursorW, LoadIconW, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, SystemParametersInfoW,
+    TrackPopupMenu, TranslateMessage, BM_CLICK, BS_OWNERDRAW, CREATESTRUCTW,
+    EVENT_OBJECT_NAMECHANGE, GWLP_USERDATA, HICON, ICON_BIG, ICON_SMALL, ICON_SMALL2, IDC_ARROW,
+    IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, OBJID_CLIENT, SPI_GETHIGHCONTRAST, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, TPM_BOTTOMALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_DRAWITEM, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NULL,
+    WM_PAINT, WM_RBUTTONUP, WM_SETFONT, WM_SETICON, WM_SETTINGCHANGE, WM_SIZE, WM_TIMER,
+    WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_CONTROLPARENT, WS_MINIMIZEBOX,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2900,6 +2900,11 @@ unsafe fn refresh_controls(hwnd: HWND, state: &AppState) {
     update_tray(hwnd, icon as HICON, &status);
     for id in [CMD_MAIN, CMD_WEB, CMD_UPDATE_DSH, CMD_CHECK_LAUNCHER] {
         InvalidateRect(GetDlgItem(hwnd, id as i32), std::ptr::null(), 1);
+    }
+    // Disabling a focused button clears thread input focus. Keep keyboard
+    // messages routed to this active window so Tab still works after a job.
+    if GetFocus().is_null() && GetForegroundWindow() == hwnd && IsWindowEnabled(hwnd) != 0 {
+        SetFocus(hwnd);
     }
 }
 
