@@ -99,6 +99,7 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const NPM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const NPM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const PROCESS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(350);
 const LAUNCHER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_LIMIT: u64 = 5 * 1024 * 1024;
@@ -114,6 +115,7 @@ const ICON_BLACK: usize = 2;
 const TRAY_MESSAGE: u32 = WM_APP + 1;
 const UI_MESSAGE: u32 = WM_APP + 2;
 const SHOW_MESSAGE: u32 = WM_APP + 3;
+const HEALTH_MESSAGE: u32 = WM_APP + 4;
 const NIN_KEYSELECT: u32 = 1025;
 const TIMER_TRAY_RETRY: usize = 1;
 const TIMER_HEALTH: usize = 2;
@@ -339,7 +341,7 @@ impl std::fmt::Display for Version {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Snapshot {
     installation: Option<Installation>,
     node_available: bool,
@@ -410,9 +412,52 @@ struct AppState {
     messages: Mutex<VecDeque<String>>,
     busy: AtomicBool,
     cancelable: AtomicBool,
-    health_checking: AtomicBool,
+    refresh: Arc<SnapshotRefresh>,
     close_notice_shown: AtomicBool,
     high_contrast: AtomicBool,
+}
+
+#[derive(Default)]
+struct SnapshotRefresh {
+    checking: AtomicBool,
+    initialized: AtomicBool,
+    generation: AtomicUsize,
+    pending: Mutex<Option<(usize, Snapshot)>>,
+}
+
+impl SnapshotRefresh {
+    fn spawn(
+        self: &Arc<Self>,
+        query: impl FnOnce() -> Snapshot + Send + 'static,
+        notify: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        if self.checking.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        let refresh = Arc::clone(self);
+        thread::spawn(move || {
+            let snapshot = query();
+            if let Ok(mut pending) = refresh.pending.lock() {
+                *pending = Some((generation, snapshot));
+            }
+            notify();
+        });
+        true
+    }
+
+    fn take_current(&self, busy: bool) -> Option<Snapshot> {
+        let pending = self.pending.lock().ok()?.take();
+        self.checking.store(false, Ordering::Release);
+        let (generation, snapshot) = pending?;
+        // A refresh started before an action must not restore its stale state
+        // after that action has completed (for example, running after Stop).
+        if busy || generation != self.generation.load(Ordering::Acquire) {
+            return None;
+        }
+        self.initialized.store(true, Ordering::Release);
+        Some(snapshot)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -593,17 +638,6 @@ fn verify_external_manifest(root: &Path) -> Result<(), String> {
 }
 
 fn discover_installation(paths: &Paths) -> Result<Option<Installation>, String> {
-    discover_installation_with_npm(paths, true)
-}
-
-fn discover_installation_without_npm(paths: &Paths) -> Result<Option<Installation>, String> {
-    discover_installation_with_npm(paths, false)
-}
-
-fn discover_installation_with_npm(
-    paths: &Paths,
-    include_npm_root: bool,
-) -> Result<Option<Installation>, String> {
     let node = find_command("node.exe");
     let Some(node) = node else {
         return Ok(None);
@@ -628,9 +662,6 @@ fn discover_installation_with_npm(
                 return Ok(Some(installation));
             }
         }
-    }
-    if !include_npm_root {
-        return Ok(None);
     }
     let npm = match find_command("npm.cmd") {
         Some(value) => value,
@@ -726,17 +757,6 @@ fn inspect_snapshot(paths: &Paths, installation: Option<Installation>) -> Snapsh
 
 fn refresh_discovery(paths: &Paths) -> Snapshot {
     match discover_installation(paths) {
-        Ok(installation) => inspect_snapshot(paths, installation),
-        Err(error) => {
-            let mut snapshot = inspect_snapshot(paths, None);
-            snapshot.discovery_error = Some(error);
-            snapshot
-        }
-    }
-}
-
-fn refresh_discovery_without_npm(paths: &Paths) -> Snapshot {
-    match discover_installation_without_npm(paths) {
         Ok(installation) => inspect_snapshot(paths, installation),
         Err(error) => {
             let mut snapshot = inspect_snapshot(paths, None);
@@ -877,7 +897,7 @@ fn stop_dsh() -> Result<String, String> {
         &format!("停止 DSH pid={pid} forced={forced}"),
     );
     Ok(if forced {
-        "DSH 已停止（常规停止超时，已强制结束）".to_owned()
+        "DSH 已停止（常规停止未完成，已强制结束进程树）".to_owned()
     } else {
         "DSH 已停止".to_owned()
     })
@@ -1672,27 +1692,76 @@ fn hidden_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
+// These local utilities must not hold startup, shutdown, or background refresh
+// indefinitely. Read stdout concurrently so a full pipe cannot stall the child.
+fn short_command_output(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("无法启动本机查询命令：{error}"))?;
+    let mut stdout = child.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    let result = (|| {
+        let status = loop {
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                return Err("本机查询命令超时".to_owned());
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let bytes = receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| "读取本机查询结果超时".to_owned())?
+            .map_err(|error| error.to_string())?;
+        Ok((status, bytes))
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
 fn tcp_open(port: u16) -> bool {
     let address = SocketAddr::from(([127, 0, 0, 1], port));
     TcpStream::connect_timeout(&address, HEALTH_TIMEOUT).is_ok()
 }
 
 fn probe_dsh(paths: &Paths) -> DshProbe {
-    probe_dsh_with(paths, probe_url)
+    probe_dsh_with(paths, |url, deadline| {
+        probe_url_with(url, |target, cookie| {
+            request_probe(target, cookie, deadline)
+        })
+    })
 }
 
 fn probe_dsh_with<F>(paths: &Paths, probe: F) -> DshProbe
 where
-    F: Fn(&str) -> ProbeResponse,
+    F: Fn(&str, Instant) -> ProbeResponse,
 {
+    let deadline = Instant::now() + HEALTH_TIMEOUT;
     let authenticated = logged_web_url(paths);
-    match probe(WEB_URL) {
+    match probe(WEB_URL, deadline) {
         ProbeResponse::Ready => DshProbe {
             identified: true,
             web_url: Some(WEB_URL.to_owned()),
         },
         ProbeResponse::AuthenticationRequired => {
-            let web_url = authenticated.filter(|url| probe(url.as_str()) == ProbeResponse::Ready);
+            let web_url =
+                authenticated.filter(|url| probe(url.as_str(), deadline) == ProbeResponse::Ready);
             DshProbe {
                 identified: true,
                 web_url,
@@ -1710,10 +1779,6 @@ enum ProbeResponse {
     Ready,
     AuthenticationRequired,
     NotDsh,
-}
-
-fn probe_url(url: &str) -> ProbeResponse {
-    probe_url_with(url, request_probe)
 }
 
 fn probe_url_with<F>(url: &str, mut request: F) -> ProbeResponse
@@ -1754,7 +1819,7 @@ where
     classify_dsh_response(&response)
 }
 
-fn request_probe(url: &str, cookie: Option<&str>) -> Option<Vec<u8>> {
+fn request_probe(url: &str, cookie: Option<&str>, deadline: Instant) -> Option<Vec<u8>> {
     let target = url.strip_prefix("http://127.0.0.1:3080")?;
     if !target.starts_with('/')
         || target
@@ -1764,26 +1829,41 @@ fn request_probe(url: &str, cookie: Option<&str>) -> Option<Vec<u8>> {
         return None;
     }
     let address = SocketAddr::from(([127, 0, 0, 1], DSH_PORT));
-    let Ok(mut stream) = TcpStream::connect_timeout(&address, HEALTH_TIMEOUT) else {
-        return None;
-    };
-    let _ = stream.set_read_timeout(Some(HEALTH_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(HEALTH_TIMEOUT));
+    request_probe_at(address, target, cookie, deadline)
+}
+
+fn request_probe_at(
+    address: SocketAddr,
+    target: &str,
+    cookie: Option<&str>,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let mut stream =
+        TcpStream::connect_timeout(&address, deadline.checked_duration_since(Instant::now())?)
+            .ok()?;
     let cookie = cookie
         .map(|value| format!("Cookie: {value}\r\n"))
         .unwrap_or_default();
-    if stream
-        .write_all(
-            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:3080\r\n{cookie}Connection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .is_err()
-    {
-        return None;
+    let request = format!(
+        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:3080\r\n{cookie}Connection: close\r\n\r\n"
+    );
+    let mut pending = request.as_bytes();
+    while !pending.is_empty() {
+        stream
+            .set_write_timeout(Some(deadline.checked_duration_since(Instant::now())?))
+            .ok()?;
+        let written = stream.write(pending).ok()?;
+        if written == 0 {
+            return None;
+        }
+        pending = &pending[written..];
     }
     let mut response = Vec::with_capacity(4096);
     let mut buffer = [0u8; 4096];
     while response.len() < 256 * 1024 {
+        stream
+            .set_read_timeout(Some(deadline.checked_duration_since(Instant::now())?))
+            .ok()?;
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
@@ -1794,14 +1874,6 @@ fn request_probe(url: &str, cookie: Option<&str>) -> Option<Vec<u8>> {
                 {
                     break;
                 }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                break;
             }
             Err(_) => return None,
         }
@@ -1974,14 +2046,14 @@ fn process_running(pid: u32) -> Result<bool, String> {
 }
 
 fn find_external_dsh_pid(port: u16) -> Result<Option<u32>, String> {
-    let output = hidden_command("netstat.exe")
-        .args(["-ano", "-p", "tcp"])
-        .output()
-        .map_err(|error| format!("无法执行 netstat：{error}"))?;
-    if !output.status.success() {
+    let (status, stdout) = short_command_output(
+        hidden_command("netstat.exe").args(["-ano", "-p", "tcp"]),
+        PROCESS_QUERY_TIMEOUT,
+    )?;
+    if !status.success() {
         return Err("netstat 无法验证 3080 端口进程".to_owned());
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&stdout)
         .lines()
         .find_map(|line| parse_listening_pid(line, port)))
 }
@@ -2001,20 +2073,21 @@ fn process_command_line(pid: u32) -> Result<Option<String>, String> {
     let script = format!(
         "$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' -ErrorAction Stop; [Console]::Out.Write($p.CommandLine)"
     );
-    let output = hidden_command("powershell.exe")
-        .args([
+    let (status, stdout) = short_command_output(
+        hidden_command("powershell.exe").args([
             "-NoLogo",
             "-NoProfile",
             "-NonInteractive",
             "-Command",
             &script,
-        ])
-        .output()
-        .map_err(|error| format!("无法查询进程命令行：{error}"))?;
-    if !output.status.success() {
+        ]),
+        PROCESS_QUERY_TIMEOUT,
+    )
+    .map_err(|error| format!("无法查询进程命令行：{error}"))?;
+    if !status.success() {
         return Ok(None);
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let value = String::from_utf8_lossy(&stdout).trim().to_owned();
     Ok((!value.is_empty()).then_some(value))
 }
 
@@ -2040,9 +2113,18 @@ fn is_dsh_command(command_line: &str, port: u16) -> bool {
 }
 
 fn terminate_pid(pid: u32) -> Result<bool, String> {
-    let _ = hidden_command("taskkill.exe")
-        .args(["/PID", &pid.to_string(), "/T"])
-        .output();
+    let requested = short_command_output(
+        hidden_command("taskkill.exe").args(["/PID", &pid.to_string(), "/T"]),
+        PROCESS_QUERY_TIMEOUT,
+    )
+    .is_ok_and(|(status, _)| status.success());
+    if !process_running(pid)? {
+        return Ok(false);
+    }
+    if !requested {
+        force_terminate_process_tree(pid)?;
+        return Ok(true);
+    }
     let deadline = Instant::now() + STOP_TIMEOUT;
     while Instant::now() < deadline {
         if !process_running(pid)? {
@@ -2055,9 +2137,10 @@ fn terminate_pid(pid: u32) -> Result<bool, String> {
 }
 
 fn force_terminate_process_tree(pid: u32) -> Result<(), String> {
-    let _ = hidden_command("taskkill.exe")
-        .args(["/PID", &pid.to_string(), "/T", "/F"])
-        .output();
+    let _ = short_command_output(
+        hidden_command("taskkill.exe").args(["/PID", &pid.to_string(), "/T", "/F"]),
+        PROCESS_QUERY_TIMEOUT,
+    );
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
         if !process_running(pid)? {
@@ -2211,17 +2294,8 @@ fn create_mutex(name: &str) -> Option<MutexGuard> {
 
 fn run_app() -> Result<(), String> {
     let paths = app_paths()?;
-    if let Some(_guard) = acquire_action_mutex() {
-        recover_for_use(&paths)?;
-        cleanup_npm_cache(&paths);
-    } else {
-        append_log(
-            &paths.logs.join("launcher.log"),
-            "启动时检测到另一个 DSH 操作，已跳过更新目录清理",
-        );
-    }
-    let snapshot = refresh_discovery_without_npm(&paths);
-    let initial_status = status_for_snapshot(&snapshot);
+    let snapshot = Snapshot::default();
+    let initial_status = "正在检查本机 DSH...".to_owned();
     let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
     if hinstance.is_null() {
         return Err("无法获取程序模块".to_owned());
@@ -2271,7 +2345,7 @@ fn run_app() -> Result<(), String> {
         messages: Mutex::new(VecDeque::new()),
         busy: AtomicBool::new(false),
         cancelable: AtomicBool::new(false),
-        health_checking: AtomicBool::new(false),
+        refresh: Arc::new(SnapshotRefresh::default()),
         close_notice_shown: AtomicBool::new(false),
         high_contrast: AtomicBool::new(high_contrast),
     });
@@ -2388,7 +2462,7 @@ unsafe extern "system" fn window_proc(
                 SetTimer(hwnd, TIMER_TRAY_RETRY, 1000, None);
             }
             SetTimer(hwnd, TIMER_HEALTH, HEALTH_INTERVAL_MS, None);
-            schedule_health(hwnd, state);
+            schedule_health(hwnd, state, true);
             0
         }
         WM_SIZE => {
@@ -2526,6 +2600,24 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        HEALTH_MESSAGE => {
+            if let Some(state) = state_for(hwnd) {
+                if let Some(snapshot) = state
+                    .refresh
+                    .take_current(state.busy.load(Ordering::Acquire))
+                {
+                    let status = status_for_snapshot(&snapshot);
+                    if let Ok(mut current) = state.snapshot.lock() {
+                        *current = snapshot;
+                    }
+                    if let Ok(mut current) = state.status.lock() {
+                        *current = status;
+                    }
+                    refresh_controls(hwnd, &state);
+                }
+            }
+            0
+        }
         WM_TIMER if wparam == TIMER_TRAY_RETRY => {
             if let Some(state) = state_for(hwnd) {
                 if add_tray(hwnd, &state) != 0 {
@@ -2537,7 +2629,7 @@ unsafe extern "system" fn window_proc(
         WM_TIMER if wparam == TIMER_HEALTH => {
             if IsWindowVisible(hwnd) != 0 {
                 if let Some(state) = state_for(hwnd) {
-                    schedule_health(hwnd, state);
+                    schedule_health(hwnd, state, false);
                 }
             } else {
                 KillTimer(hwnd, TIMER_HEALTH);
@@ -2553,7 +2645,7 @@ unsafe extern "system" fn window_proc(
                 show_main_window(hwnd);
             } else if matches!(event, WM_RBUTTONUP | WM_CONTEXTMENU) {
                 if let Some(state) = state_for(hwnd) {
-                    refresh_local_state(hwnd, &state);
+                    schedule_health(hwnd, Arc::clone(&state), true);
                     show_tray_menu(hwnd, &state);
                 }
             }
@@ -2893,17 +2985,9 @@ unsafe fn refresh_controls(hwnd: HWND, state: &AppState) {
         .snapshot
         .lock()
         .map(|value| value.clone())
-        .unwrap_or(Snapshot {
-            installation: None,
-            node_available: false,
-            npm_available: false,
-            running: false,
-            healthy: false,
-            auth_unavailable: false,
-            repair_needed: false,
-            discovery_error: None,
-        });
-    let busy = state.busy.load(Ordering::Acquire);
+        .unwrap_or_default();
+    let busy =
+        state.busy.load(Ordering::Acquire) || !state.refresh.initialized.load(Ordering::Acquire);
     let kind = main_button(&snapshot, busy, state.cancelable.load(Ordering::Acquire));
     let label = match kind {
         MainButton::Start => "启动 DSH",
@@ -2968,7 +3052,7 @@ unsafe fn handle_main_button(hwnd: HWND) {
     let snapshot = state.snapshot.lock().map(|value| value.clone()).unwrap();
     match main_button(
         &snapshot,
-        state.busy.load(Ordering::Acquire),
+        state.busy.load(Ordering::Acquire) || !state.refresh.initialized.load(Ordering::Acquire),
         state.cancelable.load(Ordering::Acquire),
     ) {
         MainButton::Start => request_operation(hwnd, Operation::Start),
@@ -2994,9 +3078,11 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
     let Some(state) = state_for(hwnd) else {
         return;
     };
-    if state.busy.swap(true, Ordering::AcqRel) {
+    if !state.refresh.initialized.load(Ordering::Acquire) || state.busy.swap(true, Ordering::AcqRel)
+    {
         return;
     }
+    state.refresh.generation.fetch_add(1, Ordering::AcqRel);
     let cancelable = matches!(operation, Operation::Install | Operation::Upgrade);
     state.cancelable.store(cancelable, Ordering::Release);
     CANCEL.store(false, Ordering::Release);
@@ -3035,13 +3121,13 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
 }
 
 fn finish_operation(hwnd: HWND, state: &Arc<AppState>, result: Result<String, String>) {
-    state.busy.store(false, Ordering::Release);
     state.cancelable.store(false, Ordering::Release);
     CANCEL.store(false, Ordering::Release);
     let snapshot = refresh_discovery(&state.paths);
     if let Ok(mut current) = state.snapshot.lock() {
         *current = snapshot;
     }
+    state.busy.store(false, Ordering::Release);
     match result {
         Ok(message) => {
             push_status(hwnd, state, message.clone());
@@ -3069,9 +3155,11 @@ unsafe fn request_launcher_check(hwnd: HWND) {
     let Some(state) = state_for(hwnd) else {
         return;
     };
-    if state.busy.swap(true, Ordering::AcqRel) {
+    if !state.refresh.initialized.load(Ordering::Acquire) || state.busy.swap(true, Ordering::AcqRel)
+    {
         return;
     }
+    state.refresh.generation.fetch_add(1, Ordering::AcqRel);
     refresh_controls(hwnd, &state);
     push_status(hwnd, &state, "正在检查启动器更新...".to_owned());
     let hwnd_value = hwnd as usize;
@@ -3098,28 +3186,39 @@ fn push_status(hwnd: HWND, state: &AppState, message: String) {
     unsafe { PostMessageW(hwnd, UI_MESSAGE, 0, 0) };
 }
 
-unsafe fn schedule_health(hwnd: HWND, state: Arc<AppState>) {
-    let visible = IsWindowVisible(hwnd) != 0;
+unsafe fn schedule_health(hwnd: HWND, state: Arc<AppState>, allow_hidden: bool) {
+    let visible = allow_hidden || IsWindowVisible(hwnd) != 0;
     let busy = state.busy.load(Ordering::Acquire);
-    let checking = state.health_checking.swap(true, Ordering::AcqRel);
+    let checking = state.refresh.checking.load(Ordering::Acquire);
     if !health_check_allowed(visible, busy, checking) {
-        if !checking {
-            state.health_checking.store(false, Ordering::Release);
-        }
         return;
     }
     let hwnd_value = hwnd as usize;
-    thread::spawn(move || {
-        let snapshot = refresh_discovery(&state.paths);
-        let status = status_for_snapshot(&snapshot);
-        if let Ok(mut current) = state.snapshot.lock() {
-            *current = snapshot;
-        }
-        state.health_checking.store(false, Ordering::Release);
-        if unsafe { IsWindowVisible(hwnd_value as HWND) } != 0 {
-            push_status(hwnd_value as HWND, &state, status);
-        }
-    });
+    let refresh = Arc::clone(&state.refresh);
+    refresh.spawn(
+        move || {
+            if !state.refresh.initialized.load(Ordering::Acquire) {
+                if let Some(_guard) = acquire_action_mutex() {
+                    if let Err(error) = recover_for_use(&state.paths) {
+                        return Snapshot {
+                            discovery_error: Some(error),
+                            ..Snapshot::default()
+                        };
+                    }
+                    cleanup_npm_cache(&state.paths);
+                } else {
+                    append_log(
+                        &state.paths.logs.join("launcher.log"),
+                        "启动时检测到另一个 DSH 操作，已跳过更新目录清理",
+                    );
+                }
+            }
+            refresh_discovery(&state.paths)
+        },
+        move || unsafe {
+            PostMessageW(hwnd_value as HWND, HEALTH_MESSAGE, 0, 0);
+        },
+    );
 }
 
 fn health_check_allowed(visible: bool, busy: bool, checking: bool) -> bool {
@@ -3151,26 +3250,14 @@ fn status_for_snapshot(snapshot: &Snapshot) -> String {
     }
 }
 
-unsafe fn refresh_local_state(hwnd: HWND, state: &AppState) {
-    let snapshot = refresh_discovery_without_npm(&state.paths);
-    let status = status_for_snapshot(&snapshot);
-    if let Ok(mut current) = state.snapshot.lock() {
-        *current = snapshot;
-    }
-    if let Ok(mut current) = state.status.lock() {
-        *current = status;
-    }
-    refresh_controls(hwnd, state);
-}
-
 unsafe fn show_main_window(hwnd: HWND) {
     ShowWindow(hwnd, SW_RESTORE);
     ShowWindow(hwnd, SW_SHOW);
     SetForegroundWindow(hwnd);
     if let Some(state) = state_for(hwnd) {
-        refresh_local_state(hwnd, &state);
+        refresh_controls(hwnd, &state);
         SetTimer(hwnd, TIMER_HEALTH, HEALTH_INTERVAL_MS, None);
-        schedule_health(hwnd, state);
+        schedule_health(hwnd, state, false);
     }
 }
 
@@ -3216,7 +3303,8 @@ unsafe fn show_tray_menu(hwnd: HWND, state: &AppState) {
             CMD_EXIT => busy,
             CMD_WEB => busy || !snapshot.healthy,
             CMD_MAIN => {
-                busy || (snapshot.installation.is_none() && !snapshot.repair_needed)
+                busy || !state.refresh.initialized.load(Ordering::Acquire)
+                    || (snapshot.installation.is_none() && !snapshot.repair_needed)
                     || (snapshot.repair_needed && !snapshot.npm_available)
             }
             _ => busy,
@@ -3243,7 +3331,18 @@ unsafe fn show_tray_menu(hwnd: HWND, state: &AppState) {
     );
     DestroyMenu(menu);
     PostMessageW(hwnd, WM_NULL, 0, 0);
-    if selected != 0 {
+    if selected == CMD_MAIN as i32 {
+        // Keep the action attached to the label the user saw, even if a
+        // background refresh completed while the menu was open.
+        let operation = if snapshot.running {
+            Operation::Stop
+        } else if snapshot.repair_needed {
+            Operation::Upgrade
+        } else {
+            Operation::Start
+        };
+        request_operation(hwnd, operation);
+    } else if selected != 0 {
         PostMessageW(hwnd, WM_COMMAND, selected as usize, 0);
     }
 }
@@ -3742,7 +3841,7 @@ mod tests {
         )
         .unwrap();
 
-        let ready = probe_dsh_with(&paths, |url| {
+        let ready = probe_dsh_with(&paths, |url, _deadline| {
             if url == WEB_URL {
                 ProbeResponse::AuthenticationRequired
             } else if url == auth_url {
@@ -3754,12 +3853,16 @@ mod tests {
         assert!(ready.identified);
         assert_eq!(ready.web_url, Some(auth_url.clone()));
 
-        let stale = probe_dsh_with(&paths, |_url| ProbeResponse::AuthenticationRequired);
+        let stale = probe_dsh_with(&paths, |_url, _deadline| {
+            ProbeResponse::AuthenticationRequired
+        });
         assert!(stale.identified);
         assert_eq!(stale.web_url, None);
 
         fs::remove_file(paths.logs.join("dsh.out.log")).unwrap();
-        let missing = probe_dsh_with(&paths, |_url| ProbeResponse::AuthenticationRequired);
+        let missing = probe_dsh_with(&paths, |_url, _deadline| {
+            ProbeResponse::AuthenticationRequired
+        });
         assert!(missing.identified);
         assert_eq!(missing.web_url, None);
 
@@ -3962,7 +4065,7 @@ mod tests {
         let log = paths.logs.join("dsh.out.log");
         let auth = "http://127.0.0.1:3080/?token=first";
         let probe = || {
-            probe_dsh_with(&paths, |url| {
+            probe_dsh_with(&paths, |url, _deadline| {
                 if url == WEB_URL {
                     ProbeResponse::AuthenticationRequired
                 } else if url == auth {
@@ -4247,6 +4350,240 @@ mod tests {
             .expect_err("unresponsive npm command must time out")
             .contains("查询 npm 全局目录超过"));
         assert_eq!(fs::read_dir(&paths.logs).unwrap().count(), 0);
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn short_command_fixture() {
+        let Ok(mode) = env::var("DSH_TEST_SHORT_COMMAND") else {
+            return;
+        };
+        if mode == "capture" {
+            print!("{}", "x".repeat(96 * 1024));
+        } else {
+            fs::write(mode, std::process::id().to_string()).unwrap();
+            thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[test]
+    fn short_commands_drain_output_and_kill_timed_out_queries() {
+        let executable = env::current_exe().unwrap();
+        let (status, bytes) = short_command_output(
+            hidden_command(&executable)
+                .args(["--exact", "tests::short_command_fixture", "--nocapture"])
+                .env("DSH_TEST_SHORT_COMMAND", "capture"),
+            PROCESS_QUERY_TIMEOUT,
+        )
+        .unwrap();
+        assert!(status.success());
+        assert!(bytes.len() >= 96 * 1024);
+
+        let pid_file = env::temp_dir().join(format!("dsh-query-{}.pid", transaction_nonce()));
+        let started = Instant::now();
+        let result = short_command_output(
+            hidden_command(executable)
+                .args(["--exact", "tests::short_command_fixture", "--nocapture"])
+                .env("DSH_TEST_SHORT_COMMAND", &pid_file),
+            Duration::from_millis(500),
+        );
+        let elapsed = started.elapsed();
+        let pid: u32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        fs::remove_file(pid_file).unwrap();
+        assert!(result.unwrap_err().contains("超时"));
+        assert!(!process_running(pid).unwrap());
+        assert!(elapsed < Duration::from_secs(3));
+        eprintln!("bounded query: {} ms", elapsed.as_millis());
+    }
+
+    struct TestChild(std::process::Child);
+
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = force_terminate_process_tree(self.0.id());
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn hidden_process_tree_fixture() {
+        let Ok(mode) = env::var("DSH_TEST_PROCESS_TREE") else {
+            return;
+        };
+        if mode == "child" {
+            thread::sleep(Duration::from_secs(30));
+            return;
+        }
+        let mut child = TestChild(
+            hidden_command(env::current_exe().unwrap())
+                .args(["--exact", "tests::hidden_process_tree_fixture"])
+                .env("DSH_TEST_PROCESS_TREE", "child")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        fs::write(mode, child.0.id().to_string()).unwrap();
+        let _ = child.0.wait();
+    }
+
+    #[test]
+    fn failed_normal_stop_does_not_wait_twelve_seconds_and_stops_descendants() {
+        let pid_file = env::temp_dir().join(format!("dsh-stop-{}.pid", transaction_nonce()));
+        let parent = TestChild(
+            hidden_command(env::current_exe().unwrap())
+                .args(["--exact", "tests::hidden_process_tree_fixture"])
+                .env("DSH_TEST_PROCESS_TREE", &pid_file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pid_file.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let child_pid: u32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        let started = Instant::now();
+        let result = terminate_pid(parent.0.id());
+        let elapsed = started.elapsed();
+        let parent_gone = !process_running(parent.0.id()).unwrap();
+        let child_gone = !process_running(child_pid).unwrap();
+        if !child_gone {
+            let _ = force_terminate_process_tree(child_pid);
+        }
+        drop(parent);
+        fs::remove_file(pid_file).unwrap();
+        assert!(result.unwrap());
+        assert!(parent_gone && child_gone);
+        assert!(elapsed < STOP_TIMEOUT / 2);
+        eprintln!("hidden process tree stop: {} ms", elapsed.as_millis());
+    }
+
+    #[test]
+    fn snapshot_refresh_is_async_coalesced_and_rejects_pre_action_results() {
+        let refresh = Arc::new(SnapshotRefresh::default());
+        for invalidate in [false, true] {
+            let (release, blocked) = std::sync::mpsc::channel();
+            let (done, completed) = std::sync::mpsc::channel();
+            let started = Instant::now();
+            assert!(refresh.spawn(
+                move || {
+                    blocked.recv_timeout(Duration::from_secs(3)).unwrap();
+                    snapshot(true, true, true, true)
+                },
+                move || {
+                    let _ = done.send(());
+                },
+            ));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(refresh.pending.lock().unwrap().is_none());
+            assert!(!refresh.spawn(|| panic!("duplicate query"), || {}));
+            if invalidate {
+                // The action can finish before the old query returns.
+                refresh.generation.fetch_add(1, Ordering::AcqRel);
+            } else {
+                assert!(!refresh.initialized.load(Ordering::Acquire));
+            }
+            release.send(()).unwrap();
+            completed.recv_timeout(Duration::from_secs(3)).unwrap();
+            let result = refresh.take_current(false);
+            assert_eq!(result.is_some(), !invalidate);
+            assert!(!refresh.checking.load(Ordering::Acquire));
+            assert!(refresh.initialized.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn trickling_http_response_cannot_extend_the_total_probe_budget() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert_ne!(stream.read(&mut request).unwrap(), 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            for _ in 0..20 {
+                thread::sleep(Duration::from_millis(100));
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+        let started = Instant::now();
+        let result = request_probe_at(address, "/", None, started + HEALTH_TIMEOUT);
+        let elapsed = started.elapsed();
+        server.join().unwrap();
+        assert!(result.is_none());
+        assert!(elapsed < Duration::from_secs(1));
+        eprintln!("trickling HTTP probe: {} ms", elapsed.as_millis());
+    }
+
+    #[test]
+    fn authentication_exchange_and_home_share_one_probe_deadline() {
+        let base = env::temp_dir().join(format!("dsh-auth-deadline-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        fs::write(
+            paths.logs.join("dsh.out.log"),
+            format!("dsh web: {WEB_URL}?token=test\n"),
+        )
+        .unwrap();
+        for (delays, ready) in [([10, 10, 10], true), ([100, 100, 300], false)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = thread::spawn(move || {
+                let accept_deadline = Instant::now() + Duration::from_secs(2);
+                for (delay, response) in delays.into_iter().zip([
+                    "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\ndsh web authentication required",
+                    "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: dsh=test; Path=/\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n__DSH_BOOT__",
+                ]) {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(_) if Instant::now() < accept_deadline => thread::sleep(Duration::from_millis(5)),
+                            Err(_) => return,
+                        }
+                    };
+                    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                    let mut request = [0; 4096];
+                    let _ = stream.read(&mut request);
+                    thread::sleep(Duration::from_millis(delay));
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            });
+            let started = Instant::now();
+            let result = probe_dsh_with(&paths, |url, deadline| {
+                probe_url_with(url, |target, cookie| {
+                    request_probe_at(
+                        address,
+                        target.strip_prefix("http://127.0.0.1:3080").unwrap(),
+                        cookie,
+                        deadline,
+                    )
+                })
+            });
+            let elapsed = started.elapsed();
+            server.join().unwrap();
+            assert!(result.identified);
+            assert_eq!(result.web_url.is_some(), ready);
+            assert!(elapsed < Duration::from_secs(1));
+            eprintln!(
+                "authentication chain ready={ready}: {} ms",
+                elapsed.as_millis()
+            );
+        }
         fs::remove_dir_all(base).unwrap();
     }
 
