@@ -1670,30 +1670,73 @@ enum ProbeResponse {
 }
 
 fn probe_url(url: &str) -> ProbeResponse {
-    let Some(target) = url.strip_prefix("http://127.0.0.1:3080") else {
+    probe_url_with(url, request_probe)
+}
+
+fn probe_url_with<F>(url: &str, mut request: F) -> ProbeResponse
+where
+    F: FnMut(&str, Option<&str>) -> Option<Vec<u8>>,
+{
+    if !valid_web_url(url) {
+        return ProbeResponse::NotDsh;
+    }
+    let Some(response) = request(url, None) else {
         return ProbeResponse::NotDsh;
     };
+    let text = String::from_utf8_lossy(&response);
+    let Some((headers, _)) = text.split_once("\r\n\r\n") else {
+        return ProbeResponse::NotDsh;
+    };
+    // Current DSH exchanges its launch token for a browser cookie, then sends
+    // a 303 to /. Follow only that local exchange, with no persistent cookie.
+    if url != WEB_URL && headers.split_whitespace().nth(1) == Some("303") {
+        let header = |name: &str| {
+            headers.lines().skip(1).find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case(name).then(|| value.trim())
+            })
+        };
+        let cookie = header("set-cookie")
+            .and_then(|value| value.split(';').next())
+            .filter(|value| {
+                value.contains('=') && value.bytes().all(|byte| byte.is_ascii_graphic())
+            });
+        if header("location") != Some("/") || cookie.is_none() {
+            return ProbeResponse::NotDsh;
+        }
+        return request(WEB_URL, cookie)
+            .map(|response| classify_dsh_response(&response))
+            .unwrap_or(ProbeResponse::NotDsh);
+    }
+    classify_dsh_response(&response)
+}
+
+fn request_probe(url: &str, cookie: Option<&str>) -> Option<Vec<u8>> {
+    let target = url.strip_prefix("http://127.0.0.1:3080")?;
     if !target.starts_with('/')
         || target
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte == b' ')
     {
-        return ProbeResponse::NotDsh;
+        return None;
     }
     let address = SocketAddr::from(([127, 0, 0, 1], DSH_PORT));
     let Ok(mut stream) = TcpStream::connect_timeout(&address, HEALTH_TIMEOUT) else {
-        return ProbeResponse::NotDsh;
+        return None;
     };
     let _ = stream.set_read_timeout(Some(HEALTH_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HEALTH_TIMEOUT));
+    let cookie = cookie
+        .map(|value| format!("Cookie: {value}\r\n"))
+        .unwrap_or_default();
     if stream
         .write_all(
-            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:3080\r\nConnection: close\r\n\r\n")
+            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:3080\r\n{cookie}Connection: close\r\n\r\n")
                 .as_bytes(),
         )
         .is_err()
     {
-        return ProbeResponse::NotDsh;
+        return None;
     }
     let mut response = Vec::with_capacity(4096);
     let mut buffer = [0u8; 4096];
@@ -1717,10 +1760,10 @@ fn probe_url(url: &str) -> ProbeResponse {
             {
                 break;
             }
-            Err(_) => return ProbeResponse::NotDsh,
+            Err(_) => return None,
         }
     }
-    classify_dsh_response(&response)
+    Some(response)
 }
 
 fn classify_dsh_response(response: &[u8]) -> ProbeResponse {
@@ -3570,6 +3613,51 @@ mod tests {
         assert!(!valid_web_url(
             "http://127.0.0.1:3080/?token=abc%0dInjected"
         ));
+    }
+
+    #[test]
+    fn authenticated_redirect_requires_cookie_and_verified_home_page() {
+        let url = "http://127.0.0.1:3080/?token=test-token";
+        let redirect = b"HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: dsh=test-cookie; HttpOnly; Path=/\r\n\r\n";
+        for (body, expected) in [
+            ("HTTP/1.1 200 OK\r\n\r\n__DSH_BOOT__", ProbeResponse::Ready),
+            (
+                "HTTP/1.1 200 OK\r\n\r\nordinary page",
+                ProbeResponse::NotDsh,
+            ),
+            (
+                "HTTP/1.1 401 Unauthorized\r\n\r\ndsh web authentication required",
+                ProbeResponse::AuthenticationRequired,
+            ),
+        ] {
+            let mut calls = Vec::new();
+            let result = probe_url_with(url, |target, cookie| {
+                calls.push((target.to_owned(), cookie.map(str::to_owned)));
+                Some(if cookie.is_none() {
+                    redirect.to_vec()
+                } else {
+                    body.as_bytes().to_vec()
+                })
+            });
+            assert_eq!(result, expected);
+            assert_eq!(
+                calls,
+                vec![
+                    (url.to_owned(), None),
+                    (WEB_URL.to_owned(), Some("dsh=test-cookie".to_owned()))
+                ]
+            );
+        }
+        for response in [
+            "HTTP/1.1 303 See Other\r\nLocation: /\r\n\r\n",
+            "HTTP/1.1 303 See Other\r\nLocation: http://example.com/\r\nSet-Cookie: dsh=test\r\n\r\n",
+            "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: invalid\r\n\r\n",
+            "HTTP/1.1 401 Unauthorized\r\n\r\ndsh web authentication required",
+        ] {
+            let mut calls = 0;
+            assert_ne!(probe_url_with(url, |_, _| { calls += 1; Some(response.as_bytes().to_vec()) }), ProbeResponse::Ready);
+            assert_eq!(calls, 1);
+        }
     }
 
     #[test]
