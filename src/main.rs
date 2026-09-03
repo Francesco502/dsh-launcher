@@ -99,7 +99,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const NPM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const NPM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
-const PROCESS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+// CIM can need several seconds on a cold Windows runner. It never runs on the UI thread.
+const PROCESS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const STOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(350);
 const LAUNCHER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_LIMIT: u64 = 5 * 1024 * 1024;
@@ -2115,7 +2117,7 @@ fn is_dsh_command(command_line: &str, port: u16) -> bool {
 fn terminate_pid(pid: u32) -> Result<bool, String> {
     let requested = short_command_output(
         hidden_command("taskkill.exe").args(["/PID", &pid.to_string(), "/T"]),
-        PROCESS_QUERY_TIMEOUT,
+        STOP_COMMAND_TIMEOUT,
     )
     .is_ok_and(|(status, _)| status.success());
     if !process_running(pid)? {
@@ -2139,7 +2141,7 @@ fn terminate_pid(pid: u32) -> Result<bool, String> {
 fn force_terminate_process_tree(pid: u32) -> Result<(), String> {
     let _ = short_command_output(
         hidden_command("taskkill.exe").args(["/PID", &pid.to_string(), "/T", "/F"]),
-        PROCESS_QUERY_TIMEOUT,
+        STOP_COMMAND_TIMEOUT,
     );
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
