@@ -98,6 +98,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(300);
 const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const NPM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
+const NPM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(350);
 const LAUNCHER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_LIMIT: u64 = 5 * 1024 * 1024;
@@ -592,6 +593,17 @@ fn verify_external_manifest(root: &Path) -> Result<(), String> {
 }
 
 fn discover_installation(paths: &Paths) -> Result<Option<Installation>, String> {
+    discover_installation_with_npm(paths, true)
+}
+
+fn discover_installation_without_npm(paths: &Paths) -> Result<Option<Installation>, String> {
+    discover_installation_with_npm(paths, false)
+}
+
+fn discover_installation_with_npm(
+    paths: &Paths,
+    include_npm_root: bool,
+) -> Result<Option<Installation>, String> {
     let node = find_command("node.exe");
     let Some(node) = node else {
         return Ok(None);
@@ -617,18 +629,28 @@ fn discover_installation(paths: &Paths) -> Result<Option<Installation>, String> 
             }
         }
     }
+    if !include_npm_root {
+        return Ok(None);
+    }
     let npm = match find_command("npm.cmd") {
         Some(value) => value,
         None => return Ok(None),
     };
-    let output = hidden_command(&npm)
-        .args(["root", "-g"])
-        .output()
-        .map_err(|error| format!("无法查询 npm 全局目录：{error}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let mut command = hidden_command(&npm);
+    command.args(["root", "-g"]);
+    let root = match run_capture(
+        paths,
+        &mut command,
+        "查询 npm 全局目录",
+        NPM_DISCOVERY_TIMEOUT,
+        false,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            append_log(&paths.logs.join("launcher.log"), &error);
+            return Ok(None);
+        }
+    };
     if root.is_empty() {
         return Ok(None);
     }
@@ -704,6 +726,17 @@ fn inspect_snapshot(paths: &Paths, installation: Option<Installation>) -> Snapsh
 
 fn refresh_discovery(paths: &Paths) -> Snapshot {
     match discover_installation(paths) {
+        Ok(installation) => inspect_snapshot(paths, installation),
+        Err(error) => {
+            let mut snapshot = inspect_snapshot(paths, None);
+            snapshot.discovery_error = Some(error);
+            snapshot
+        }
+    }
+}
+
+fn refresh_discovery_without_npm(paths: &Paths) -> Snapshot {
+    match discover_installation_without_npm(paths) {
         Ok(installation) => inspect_snapshot(paths, installation),
         Err(error) => {
             let mut snapshot = inspect_snapshot(paths, None);
@@ -819,7 +852,7 @@ fn isolate_daemon_stdio() -> Result<(), String> {
 
 fn stop_dsh() -> Result<String, String> {
     let paths = app_paths()?;
-    let pid = read_tracked_pid(&paths).filter(|pid| process_running(*pid).unwrap_or(false));
+    let pid = tracked_dsh_pid(&paths)?;
     let pid = match pid {
         Some(pid) => pid,
         None if tcp_open(DSH_PORT) => find_external_dsh_pid(DSH_PORT)?.ok_or_else(|| {
@@ -1902,14 +1935,26 @@ fn read_tracked_pid(paths: &Paths) -> Option<u32> {
 }
 
 fn tracked_process_running(paths: &Paths) -> Result<bool, String> {
+    Ok(tracked_dsh_pid(paths)?.is_some())
+}
+
+fn tracked_dsh_pid(paths: &Paths) -> Result<Option<u32>, String> {
     let Some(pid) = read_tracked_pid(paths) else {
-        return Ok(false);
+        return Ok(None);
     };
-    if process_running(pid)? {
-        Ok(true)
+    if !process_running(pid)? {
+        let _ = fs::remove_file(paths.pid_file());
+        return Ok(None);
+    }
+    let Some(command_line) = process_command_line(pid)? else {
+        let _ = fs::remove_file(paths.pid_file());
+        return Ok(None);
+    };
+    if is_dsh_command(&command_line, DSH_PORT) {
+        Ok(Some(pid))
     } else {
         let _ = fs::remove_file(paths.pid_file());
-        Ok(false)
+        Ok(None)
     }
 }
 
@@ -2175,7 +2220,7 @@ fn run_app() -> Result<(), String> {
             "启动时检测到另一个 DSH 操作，已跳过更新目录清理",
         );
     }
-    let snapshot = refresh_discovery(&paths);
+    let snapshot = refresh_discovery_without_npm(&paths);
     let initial_status = status_for_snapshot(&snapshot);
     let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
     if hinstance.is_null() {
@@ -3065,12 +3110,7 @@ unsafe fn schedule_health(hwnd: HWND, state: Arc<AppState>) {
     }
     let hwnd_value = hwnd as usize;
     thread::spawn(move || {
-        let mut snapshot = state.snapshot.lock().map(|value| value.clone()).unwrap();
-        let tracked = tracked_process_running(&state.paths).unwrap_or(false);
-        let probe = probe_dsh(&state.paths);
-        snapshot.healthy = probe.web_url.is_some();
-        snapshot.auth_unavailable = probe.identified && !snapshot.healthy;
-        snapshot.running = tracked || probe.identified;
+        let snapshot = refresh_discovery(&state.paths);
         let status = status_for_snapshot(&snapshot);
         if let Ok(mut current) = state.snapshot.lock() {
             *current = snapshot;
@@ -3112,7 +3152,7 @@ fn status_for_snapshot(snapshot: &Snapshot) -> String {
 }
 
 unsafe fn refresh_local_state(hwnd: HWND, state: &AppState) {
-    let snapshot = refresh_discovery(&state.paths);
+    let snapshot = refresh_discovery_without_npm(&state.paths);
     let status = status_for_snapshot(&snapshot);
     if let Ok(mut current) = state.snapshot.lock() {
         *current = snapshot;
@@ -4152,6 +4192,10 @@ mod tests {
             r#"node C:\pkg\@deepseek-ai\dsh\lib\bin.js web --port 3080"#,
             3080
         ));
+        assert!(is_dsh_command(
+            r#"node --require D:\data\state\browser-entry.cjs C:\pkg\@deepseek-ai\dsh\lib\bin.js web --port 3080"#,
+            3080
+        ));
         assert!(!is_dsh_command(
             r#"node C:\other\server.js web --port 3080"#,
             3080
@@ -4160,6 +4204,50 @@ mod tests {
             r#"node C:\pkg\@deepseek-ai\dsh\lib\bin.js web --port 3081"#,
             3080
         ));
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn stale_pid_for_unrelated_process_is_discarded() {
+        let base = env::temp_dir().join(format!("dsh-launcher-stale-pid-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let mut unrelated = hidden_command("cmd.exe")
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .spawn()
+            .unwrap();
+        fs::write(paths.pid_file(), unrelated.id().to_string()).unwrap();
+
+        assert!(!tracked_process_running(&paths).unwrap());
+        assert!(!paths.pid_file().exists());
+
+        let _ = force_terminate_process_tree(unrelated.id());
+        let _ = unrelated.wait();
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn npm_discovery_command_is_bounded() {
+        let base =
+            env::temp_dir().join(format!("dsh-launcher-npm-timeout-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let mut command = hidden_command("cmd.exe");
+        command.args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"]);
+
+        let result = run_capture(
+            &paths,
+            &mut command,
+            "查询 npm 全局目录",
+            Duration::from_millis(500),
+            false,
+        );
+        assert!(result
+            .expect_err("unresponsive npm command must time out")
+            .contains("查询 npm 全局目录超过"));
+        assert_eq!(fs::read_dir(&paths.logs).unwrap().count(), 0);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
