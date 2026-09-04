@@ -47,7 +47,7 @@
 
 下载前要求更新盘至少有 512 MiB 可用空间。npm 缓存、更新暂存和命令临时文件都位于便携目录；缓存会在查询或安装后清空。
 
-DSH 输出位于 `data\logs\dsh.out.log` 和 `data\logs\dsh.err.log`，每类最多五个 5 MiB 文件。错误对话框显示摘要和日志路径，可按 Ctrl+C 复制详情。
+DSH 输出位于 `data\logs\dsh.out.log` 和 `data\logs\dsh.err.log`，运行期间持续轮转，每类最多五个文件（当前文件加四个归档），每个不超过 5 MiB。退出启动器面板后日志仍持续受限；轮转保留当前认证入口，重新打开面板后仍可使用 Web UI。错误对话框显示摘要和日志路径，可按 Ctrl+C 复制详情。
 
 ## CLI
 

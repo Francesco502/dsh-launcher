@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod log_relay;
+
 use std::collections::VecDeque;
 use std::env;
 use std::ffi::{c_void, OsStr};
@@ -15,8 +17,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, ERROR_ALREADY_EXISTS, HANDLE,
-    HANDLE_FLAG_INHERIT, HWND, LPARAM, POINT, RECT, WPARAM,
+    CloseHandle, GetLastError, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_INVALID_PARAMETER,
+    ERROR_NO_MORE_FILES, FILETIME, HANDLE, HANDLE_FLAG_INHERIT, HWND, INVALID_HANDLE_VALUE, LPARAM,
+    POINT, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
@@ -39,11 +42,15 @@ use windows_sys::Win32::System::Console::{
     AttachConsole, GetConsoleMode, GetStdHandle, WriteConsoleW, ATTACH_PARENT_PROCESS,
     STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemServices::SS_CENTER;
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetExitCodeProcess, OpenProcess, ReleaseMutex, TerminateProcess,
-    CREATE_NO_WINDOW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    CreateMutexW, GetExitCodeProcess, GetProcessTimes, OpenProcess, ReleaseMutex, TerminateProcess,
+    WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE,
 };
 use windows_sys::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
@@ -216,12 +223,16 @@ impl Paths {
             .parent()
             .ok_or_else(|| "无法定位启动器目录".to_owned())?
             .to_path_buf();
+        Self::at_root(&root)
+    }
+
+    fn at_root(root: &Path) -> Result<Self, String> {
         if !root.join(PORTABLE_MARKER).is_file() {
             return Err(
                 "请下载并完整解压 DSH 启动器便携包；当前目录缺少 portable.flag。".to_owned(),
             );
         }
-        verify_external_manifest(&root)?;
+        verify_external_manifest(root)?;
         let data = root.join(DATA_DIRECTORY);
         let paths = Self {
             npm_prefix: data.join("npm-global"),
@@ -491,6 +502,22 @@ fn main() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     let args: Vec<String> = env::args().collect();
+    if log_relay::is_worker(&args) {
+        let result = ensure_not_elevated().and_then(|_| {
+            let paths = Paths::at_root(Path::new(&args[2]))?;
+            log_relay::run(&paths, Path::new(&args[3]), Path::new(&args[4]))
+        });
+        let code = match result {
+            Ok(code) => code,
+            Err(error) => {
+                if let Ok(paths) = Paths::at_root(Path::new(&args[2])) {
+                    append_log(&paths.logs.join("launcher.log"), &error);
+                }
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     if is_release_smoke(&args) {
         attach_console();
         exit_with(run_release_smoke());
@@ -793,32 +820,33 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
     if tcp_open(DSH_PORT) {
         return Err("3080 端口已被其他程序占用；未启动 DSH。".to_owned());
     }
-    rotate_log(&paths.logs.join("dsh.out.log"))?;
-    rotate_log(&paths.logs.join("dsh.err.log"))?;
-    let stdout = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.logs.join("dsh.out.log"))
-        .map_err(|error| format!("无法打开 DSH 输出日志：{error}"))?;
-    let stderr = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.logs.join("dsh.err.log"))
-        .map_err(|error| format!("无法打开 DSH 错误日志：{error}"))?;
     let browser_entry = paths.state.join("browser-entry.cjs");
     if fs::read(&browser_entry).ok().as_deref() != Some(BROWSER_ENTRY) {
-        fs::write(&browser_entry, BROWSER_ENTRY)
-            .map_err(|error| format!("无法准备浏览器本机入口：{error}"))?;
+        atomic_write(&browser_entry, BROWSER_ENTRY)?;
     }
-    let mut command = hidden_command(&installation.node);
+    // Run a cached copy so logging does not keep the user-facing EXE locked.
+    let helper = paths.state.join("log-worker.exe");
+    let executable = env::current_exe().map_err(|error| error.to_string())?;
+    let bytes = fs::read(executable).map_err(|error| format!("无法准备日志进程：{error}"))?;
+    if fs::read(&helper).ok().as_deref() != Some(bytes.as_slice()) {
+        atomic_write(&helper, &bytes)?;
+    }
+    let mut command = hidden_command(helper);
     command
-        .arg("--require")
-        .arg(&browser_entry)
+        .arg("--dsh-log-worker")
+        .arg(
+            paths
+                .data
+                .parent()
+                .ok_or_else(|| "启动器目录无效".to_owned())?,
+        )
+        .arg(&installation.node)
         .arg(&installation.entry)
         .args(["web", "--no-open", "--host", "127.0.0.1", "--port", "3080"])
+        .env_remove(CLI_OUTPUT_ENV)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr));
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     if installation.profile == ProfileMode::Portable {
         fs::create_dir_all(&paths.profile)
             .map_err(|error| format!("无法创建便携配置目录：{error}"))?;
@@ -847,7 +875,8 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
         }
         thread::sleep(Duration::from_millis(350));
     }
-    let _ = terminate_pid(child.id());
+    terminate_pid(child.id())
+        .map_err(|error| format!("DSH 启动超时，且进程树未能停止：{error}"))?;
     let _ = fs::remove_file(paths.pid_file());
     mark_repair_needed(paths, installation);
     Err(format!(
@@ -1657,14 +1686,16 @@ fn run_capture(
             break status;
         }
         if cancellable && CANCEL.load(Ordering::Acquire) {
-            let _ = force_terminate_process_tree(child.id());
+            force_terminate_process_tree(child.id())
+                .map_err(|error| format!("{label}无法取消：{error}"))?;
             let _ = child.wait();
             let _ = fs::remove_file(&stdout_path);
             let _ = fs::remove_file(&stderr_path);
             return Err("操作已取消".to_owned());
         }
         if Instant::now() >= deadline {
-            let _ = force_terminate_process_tree(child.id());
+            force_terminate_process_tree(child.id())
+                .map_err(|error| format!("{label}超时且无法停止：{error}"))?;
             let _ = child.wait();
             let _ = fs::remove_file(&stdout_path);
             let _ = fs::remove_file(&stderr_path);
@@ -2115,51 +2146,197 @@ fn is_dsh_command(command_line: &str, port: u16) -> bool {
 }
 
 fn terminate_pid(pid: u32) -> Result<bool, String> {
-    let requested = short_command_output(
-        hidden_command("taskkill.exe").args(["/PID", &pid.to_string(), "/T"]),
-        STOP_COMMAND_TIMEOUT,
-    )
-    .is_ok_and(|(status, _)| status.success());
-    if !process_running(pid)? {
+    terminate_pid_with(pid, |pid| {
+        short_command_output(
+            hidden_command("taskkill.exe").args(["/PID", &pid.to_string(), "/T"]),
+            STOP_COMMAND_TIMEOUT,
+        )
+        .is_ok_and(|(status, _)| status.success())
+    })
+}
+
+fn terminate_pid_with(pid: u32, request: impl FnOnce(u32) -> bool) -> Result<bool, String> {
+    // Capture before requesting exit: the root may disappear before its children.
+    let mut tree = ProcessTree::capture(pid)?;
+    let requested = request(pid);
+    if tree.finished()? {
         return Ok(false);
     }
-    if !requested {
-        force_terminate_process_tree(pid)?;
+    if !requested || !process_running(pid)? {
+        tree.terminate()?;
         return Ok(true);
     }
     let deadline = Instant::now() + STOP_TIMEOUT;
     while Instant::now() < deadline {
-        if !process_running(pid)? {
+        if tree.finished()? {
             return Ok(false);
         }
         thread::sleep(Duration::from_millis(200));
     }
-    force_terminate_process_tree(pid)?;
+    tree.terminate()?;
     Ok(true)
 }
 
 fn force_terminate_process_tree(pid: u32) -> Result<(), String> {
-    let _ = short_command_output(
-        hidden_command("taskkill.exe").args(["/PID", &pid.to_string(), "/T", "/F"]),
-        STOP_COMMAND_TIMEOUT,
-    );
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if !process_running(pid)? {
+    ProcessTree::capture(pid)?.terminate()
+}
+
+struct ProcessHandle(HANDLE);
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+impl ProcessHandle {
+    fn open(pid: u32) -> Result<Option<Self>, String> {
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if !handle.is_null() {
+            Ok(Some(Self(handle)))
+        } else if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER {
+            Ok(None)
+        } else {
+            Err(format!("无法验证或停止进程 {pid}：{}", unsafe {
+                GetLastError()
+            }))
+        }
+    }
+
+    fn running(&self) -> Result<bool, String> {
+        match unsafe { WaitForSingleObject(self.0, 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            _ => Err("无法核验进程退出状态".to_owned()),
+        }
+    }
+
+    fn times(&self) -> Result<(u64, Option<u64>), String> {
+        let has_exited = !self.running()?;
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        if unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) }
+            == 0
+        {
+            return Err("无法核验进程创建时间".to_owned());
+        }
+        let timestamp =
+            |time: FILETIME| u64::from(time.dwHighDateTime) << 32 | u64::from(time.dwLowDateTime);
+        Ok((timestamp(created), has_exited.then(|| timestamp(exited))))
+    }
+}
+
+struct ProcessTree(Vec<(u32, ProcessHandle)>);
+
+impl ProcessTree {
+    fn capture(pid: u32) -> Result<Self, String> {
+        let mut tree = Self(
+            ProcessHandle::open(pid)?
+                .into_iter()
+                .map(|handle| (pid, handle))
+                .collect(),
+        );
+        tree.refresh()?;
+        Ok(tree)
+    }
+
+    fn refresh(&mut self) -> Result<(), String> {
+        if self.0.is_empty() {
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(100));
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err("无法核验 DSH 子进程列表".to_owned());
+        }
+        let snapshot = ProcessHandle(snapshot);
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..PROCESSENTRY32W::default()
+        };
+        let mut pairs = Vec::new();
+        let mut next = unsafe { Process32FirstW(snapshot.0, &mut entry) };
+        while next != 0 {
+            pairs.push((entry.th32ProcessID, entry.th32ParentProcessID));
+            next = unsafe { Process32NextW(snapshot.0, &mut entry) };
+        }
+        if unsafe { GetLastError() } != ERROR_NO_MORE_FILES {
+            return Err("无法完整读取 DSH 子进程列表".to_owned());
+        }
+        // Retained handles and creation times prevent a reused PID from being killed.
+        loop {
+            let before = self.0.len();
+            for &(pid, parent_pid) in &pairs {
+                if self.0.iter().any(|(known, _)| *known == pid) {
+                    continue;
+                }
+                let Some((_, parent)) = self.0.iter().find(|(known, _)| *known == parent_pid)
+                else {
+                    continue;
+                };
+                let parent_times = parent.times()?;
+                let Some(child) = ProcessHandle::open(pid)? else {
+                    continue;
+                };
+                let created = child.times()?.0;
+                if created >= parent_times.0 && parent_times.1.is_none_or(|exit| created <= exit) {
+                    self.0.push((pid, child));
+                }
+            }
+            if self.0.len() == before {
+                return Ok(());
+            }
+        }
     }
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        return Err(format!("无法打开进程 {pid} 进行强制停止"));
+
+    fn finished(&mut self) -> Result<bool, String> {
+        self.refresh()?;
+        for (_, process) in &self.0 {
+            if process.running()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
-    let ok = unsafe { TerminateProcess(handle, 1) } != 0;
-    unsafe { CloseHandle(handle) };
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("无法停止进程 {pid}"))
+
+    fn terminate(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            self.refresh()?;
+            for (pid, process) in self.0.iter().rev() {
+                if process.running()?
+                    && unsafe { TerminateProcess(process.0, 1) } == 0
+                    && process.running()?
+                {
+                    // A parent can already be exiting after its child exits, but
+                    // its handle may not be signaled yet. Verify within the same budget.
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    unsafe {
+                        WaitForSingleObject(process.0, remaining.as_millis().min(100) as u32)
+                    };
+                    if process.running()? && Instant::now() >= deadline {
+                        return Err(format!("无法停止子进程 {pid}；进程树尚未完全退出"));
+                    }
+                }
+            }
+            // Refresh again to include descendants created during termination.
+            if self.finished()? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err("DSH 进程树未在时限内完全退出".to_owned());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -4464,6 +4641,61 @@ mod tests {
         assert!(parent_gone && child_gone);
         assert!(elapsed < STOP_TIMEOUT / 2);
         eprintln!("hidden process tree stop: {} ms", elapsed.as_millis());
+    }
+
+    #[test]
+    fn native_stop_cleans_descendants_when_the_tool_fails_or_only_the_root_exits() {
+        for root_exits in [false, true] {
+            let pid_file =
+                env::temp_dir().join(format!("dsh-native-stop-{}.pid", transaction_nonce()));
+            let parent = TestChild(
+                hidden_command(env::current_exe().unwrap())
+                    .args(["--exact", "tests::hidden_process_tree_fixture"])
+                    .env("DSH_TEST_PROCESS_TREE", &pid_file)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let unrelated = TestChild(
+                hidden_command(env::current_exe().unwrap())
+                    .args(["--exact", "tests::hidden_process_tree_fixture"])
+                    .env("DSH_TEST_PROCESS_TREE", "child")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !pid_file.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            let child_pid: u32 = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+            let result = terminate_pid_with(parent.0.id(), |pid| {
+                if root_exits {
+                    let process = ProcessHandle::open(pid).unwrap().unwrap();
+                    assert_ne!(unsafe { TerminateProcess(process.0, 1) }, 0);
+                    assert_eq!(
+                        unsafe { WaitForSingleObject(process.0, 1000) },
+                        WAIT_OBJECT_0
+                    );
+                }
+                root_exits // Simulate either a failed tool or a misleading successful root-only exit.
+            });
+            let parent_gone = !process_running(parent.0.id()).unwrap();
+            let child_gone = !process_running(child_pid).unwrap();
+            if !child_gone {
+                let _ = force_terminate_process_tree(child_pid);
+            }
+            assert!(process_running(unrelated.0.id()).unwrap());
+            drop(unrelated);
+            drop(parent);
+            fs::remove_file(pid_file).unwrap();
+            assert!(result.unwrap());
+            assert!(parent_gone && child_gone);
+        }
     }
 
     #[test]
