@@ -8,6 +8,7 @@ use std::ffi::{c_void, OsStr};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -34,9 +35,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     TRANSPARENT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, GetDiskFreeSpaceExW, GetFileType, MoveFileExW, WriteFile, FILE_ATTRIBUTE_NORMAL,
-    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_PIPE,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
+    CreateFileW, GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileType, MoveFileExW,
+    WriteFile, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_PIPE, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
     AttachConsole, GetConsoleMode, GetStdHandle, WriteConsoleW, ATTACH_PARENT_PROCESS,
@@ -125,6 +127,7 @@ const TRAY_MESSAGE: u32 = WM_APP + 1;
 const UI_MESSAGE: u32 = WM_APP + 2;
 const SHOW_MESSAGE: u32 = WM_APP + 3;
 const HEALTH_MESSAGE: u32 = WM_APP + 4;
+const OPERATION_MESSAGE: u32 = WM_APP + 5;
 const NIN_KEYSELECT: u32 = 1025;
 const TIMER_TRAY_RETRY: usize = 1;
 const TIMER_HEALTH: usize = 2;
@@ -423,6 +426,7 @@ struct AppState {
     snapshot: Mutex<Snapshot>,
     status: Mutex<String>,
     messages: Mutex<VecDeque<String>>,
+    operation_result: Mutex<Option<(Snapshot, Result<String, String>)>>,
     busy: AtomicBool,
     cancelable: AtomicBool,
     refresh: Arc<SnapshotRefresh>,
@@ -649,7 +653,7 @@ fn parse_runtime_manifest(text: &str) -> Result<RuntimeManifest, String> {
         || manifest.entry != "lib/bin.js"
         || manifest.node_download_page != NODE_DOWNLOAD_URL
     {
-        return Err("运行清单不符合 0.3.1 轻量契约".to_owned());
+        return Err("运行清单不符合轻量便携包契约".to_owned());
     }
     Ok(manifest)
 }
@@ -853,6 +857,10 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
         command.env("DSH_HOME", &paths.profile);
     }
     command.env("TEMP", &paths.temp).env("TMP", &paths.temp);
+    let error_position = fs::File::open(paths.logs.join("dsh.err.log"))
+        .ok()
+        .as_ref()
+        .and_then(startup_log_position);
     isolate_daemon_stdio()?;
     let child = command
         .spawn()
@@ -867,10 +875,11 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
         }
         if !process_running(child.id())? {
             let _ = fs::remove_file(paths.pid_file());
-            mark_repair_needed(paths, installation);
-            return Err(format!(
-                "DSH 启动进程已退出。日志：{}",
-                paths.logs.join("dsh.err.log").display()
+            return Err(startup_failure(
+                paths,
+                installation,
+                error_position,
+                "DSH 启动进程已退出",
             ));
         }
         thread::sleep(Duration::from_millis(350));
@@ -878,11 +887,103 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
     terminate_pid(child.id())
         .map_err(|error| format!("DSH 启动超时，且进程树未能停止：{error}"))?;
     let _ = fs::remove_file(paths.pid_file());
-    mark_repair_needed(paths, installation);
-    Err(format!(
-        "DSH 启动超时。日志：{}",
-        paths.logs.join("dsh.err.log").display()
+    Err(startup_failure(
+        paths,
+        installation,
+        error_position,
+        "DSH 启动超时",
     ))
+}
+
+struct StartupLogPosition {
+    identity: (u32, u32, u32),
+    offset: u64,
+}
+
+fn startup_log_position(file: &fs::File) -> Option<StartupLogPosition> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    Some(StartupLogPosition {
+        identity: (
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ),
+        offset: (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow),
+    })
+}
+
+fn startup_failure(
+    paths: &Paths,
+    installation: &Installation,
+    error_position: Option<StartupLogPosition>,
+    reason: &str,
+) -> String {
+    let log = paths.logs.join("dsh.err.log");
+    // Read only this attempt's bounded tail. An old plugin failure must not
+    // explain a later failure which emitted no plugin diagnostics.
+    let detail = (|| -> std::io::Result<String> {
+        let mut file = fs::File::open(&log)?;
+        let length = file.metadata()?.len();
+        // A rotated file contains this attempt's output from byte zero,
+        // even when it has already grown beyond the previous file's offset.
+        let error_offset = error_position
+            .filter(|previous| {
+                startup_log_position(&file)
+                    .is_some_and(|current| current.identity == previous.identity)
+            })
+            .map_or(0, |previous| previous.offset.min(length));
+        file.seek(SeekFrom::Start(
+            error_offset.max(length.saturating_sub(64 * 1024)),
+        ))?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })()
+    .unwrap_or_default();
+    let plugin_failure = detail.contains("plugin tree failed to load")
+        || detail.contains("failed to import loader entry")
+        || detail.contains("failed to apply loader entry");
+    let message = if plugin_failure {
+        let mut plugins = Vec::new();
+        for line in detail.lines() {
+            if !line.contains("failed to import loader entry")
+                && !line.contains("failed to apply loader entry")
+            {
+                continue;
+            }
+            let Some(name) = line
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(name, _)| name)
+            else {
+                continue;
+            };
+            // Do not copy arbitrary log text or credentials into the dialog.
+            if name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"@/._-".contains(&byte))
+                && !name.is_empty()
+                && name.len() <= 120
+                && !plugins.contains(&name)
+                && plugins.len() < 4
+            {
+                plugins.push(name);
+            }
+        }
+        let packages = if plugins.is_empty() {
+            String::new()
+        } else {
+            format!("\n涉及插件：{}", plugins.join("、"))
+        };
+        format!("DSH 插件加载失败；请检查插件与 DSH {} 的兼容性，更新或停用出错插件后重试。重新安装 DSH 不会修复插件。{packages}", installation.version)
+    } else {
+        mark_repair_needed(paths, installation);
+        reason.to_owned()
+    };
+    format!("{message}\n日志：{}", log.display())
 }
 
 fn isolate_daemon_stdio() -> Result<(), String> {
@@ -914,8 +1015,22 @@ fn stop_dsh() -> Result<String, String> {
             return Ok("DSH 已停止".to_owned());
         }
     };
-    let command_line = process_command_line(pid)?
-        .ok_or_else(|| format!("无法验证进程 {pid} 的命令行；未停止任何进程。"))?;
+    stop_verified_dsh(&paths, pid, process_command_line(pid))
+}
+
+fn stop_verified_dsh(
+    paths: &Paths,
+    pid: u32,
+    command_line: Result<Option<String>, String>,
+) -> Result<String, String> {
+    // The startup worker can exit while CIM is reading its command line.
+    // A completed stop must not turn into an identity-query error.
+    if !process_running(pid)? && !tcp_open(DSH_PORT) {
+        let _ = fs::remove_file(paths.pid_file());
+        return Ok("DSH 已停止".to_owned());
+    }
+    let command_line =
+        command_line?.ok_or_else(|| format!("无法验证进程 {pid} 的命令行；未停止任何进程。"))?;
     if !is_dsh_command(&command_line, DSH_PORT) {
         return Err(format!(
             "进程 {pid} 不是可验证的 DSH 服务；未停止任何进程。"
@@ -927,11 +1042,7 @@ fn stop_dsh() -> Result<String, String> {
         &paths.logs.join("launcher.log"),
         &format!("停止 DSH pid={pid} forced={forced}"),
     );
-    Ok(if forced {
-        "DSH 已停止（常规停止未完成，已强制结束进程树）".to_owned()
-    } else {
-        "DSH 已停止".to_owned()
-    })
+    Ok("DSH 已停止".to_owned())
 }
 
 fn install_or_update(
@@ -1050,7 +1161,7 @@ fn install_or_update(
         match start_result {
             Ok(_) => Ok(format!("DSH 已更新到 {target_version} 并重新启动")),
             Err(error) => Err(format!(
-                "DSH 已更新到 {target_version}，但启动失败：{error}\n最新版本已保留，可重新安装同一版本。"
+                "DSH 已更新到 {target_version}，但启动失败：{error}\n最新版本已保留。"
             )),
         }
     } else {
@@ -2522,6 +2633,7 @@ fn run_app() -> Result<(), String> {
         snapshot: Mutex::new(snapshot),
         status: Mutex::new(initial_status),
         messages: Mutex::new(VecDeque::new()),
+        operation_result: Mutex::new(None),
         busy: AtomicBool::new(false),
         cancelable: AtomicBool::new(false),
         refresh: Arc::new(SnapshotRefresh::default()),
@@ -2761,6 +2873,22 @@ unsafe extern "system" fn window_proc(
                 DeleteObject(brush);
             }
             EndPaint(hwnd, &paint);
+            0
+        }
+        OPERATION_MESSAGE => {
+            if let Some(state) = state_for(hwnd) {
+                let pending = state
+                    .operation_result
+                    .lock()
+                    .ok()
+                    .and_then(|mut result| result.take());
+                if let Some((snapshot, result)) = pending {
+                    if let Ok(mut current) = state.snapshot.lock() {
+                        *current = snapshot;
+                    }
+                    finish_operation(hwnd, &state, result);
+                }
+            }
             0
         }
         UI_MESSAGE => {
@@ -3271,7 +3399,7 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
         let _guard = match acquire_action_mutex() {
             Some(value) => value,
             None => {
-                finish_operation(
+                post_operation_result(
                     hwnd_value as HWND,
                     &state,
                     Err("已有启动器操作正在执行".to_owned()),
@@ -3295,18 +3423,23 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
                 install_or_update(false, &progress, Some(&confirm))
             }
         });
-        finish_operation(hwnd_value as HWND, &state, result);
+        post_operation_result(hwnd_value as HWND, &state, result);
     });
 }
 
+fn post_operation_result(hwnd: HWND, state: &Arc<AppState>, result: Result<String, String>) {
+    let snapshot = refresh_discovery(&state.paths);
+    if let Ok(mut pending) = state.operation_result.lock() {
+        *pending = Some((snapshot, result));
+    }
+    unsafe { PostMessageW(hwnd, OPERATION_MESSAGE, 0, 0) };
+}
+
 fn finish_operation(hwnd: HWND, state: &Arc<AppState>, result: Result<String, String>) {
+    // Dialogs and controls belong to the window thread. Keep exit disabled
+    // until the modal error dialog is dismissed and all UI work is complete.
     state.cancelable.store(false, Ordering::Release);
     CANCEL.store(false, Ordering::Release);
-    let snapshot = refresh_discovery(&state.paths);
-    if let Ok(mut current) = state.snapshot.lock() {
-        *current = snapshot;
-    }
-    state.busy.store(false, Ordering::Release);
     match result {
         Ok(message) => {
             push_status(hwnd, state, message.clone());
@@ -3327,6 +3460,7 @@ fn finish_operation(hwnd: HWND, state: &Arc<AppState>, result: Result<String, St
             }
         }
     }
+    state.busy.store(false, Ordering::Release);
     unsafe { refresh_controls(hwnd, state) };
 }
 
@@ -3789,6 +3923,61 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn startup_plugin_failure_is_retryable_and_does_not_request_reinstallation() {
+        let base = env::temp_dir().join(format!("dsh-plugin-start-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let installation = snapshot(true, true, true, false).installation.unwrap();
+        let log = paths.logs.join("dsh.err.log");
+        fs::write(&log, "old unrelated output\n").unwrap();
+        let offset = startup_log_position(&fs::File::open(&log).unwrap());
+        append_log(&log, "Error: dsh: plugin tree failed to load\nError: failed to import loader entry web-ui-settings (@linxin666/dsh-client-ui-web-ui-settings): The requested module '@deepseek-ai/dsh-settings' does not provide an export named 'settingsNamespace'\nsecret=not-for-the-dialog");
+        let error = startup_failure(&paths, &installation, offset, "DSH 启动进程已退出");
+        assert!(error.contains("插件加载失败"));
+        assert!(error.contains("@linxin666/dsh-client-ui-web-ui-settings"));
+        assert!(!error.contains("not-for-the-dialog"));
+        assert!(!paths.repair_file().exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn startup_diagnostics_do_not_reuse_an_earlier_plugin_failure() {
+        let base = env::temp_dir().join(format!("dsh-plugin-stale-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let installation = snapshot(true, true, true, false).installation.unwrap();
+        let log = paths.logs.join("dsh.err.log");
+        fs::write(&log, "Error: dsh: plugin tree failed to load\n").unwrap();
+        let offset = startup_log_position(&fs::File::open(&log).unwrap());
+        append_log(&log, "Error: Cannot find module bin.js");
+        let error = startup_failure(&paths, &installation, offset, "DSH 启动进程已退出");
+        assert!(!error.contains("插件加载失败"));
+        assert!(paths.repair_file().exists());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn startup_plugin_diagnostics_survive_error_log_rotation() {
+        let base = env::temp_dir().join(format!("dsh-plugin-rotate-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let installation = snapshot(true, true, true, false).installation.unwrap();
+        let log = paths.logs.join("dsh.err.log");
+        for old_length in [16, LOG_LIMIT as usize] {
+            fs::write(&log, vec![b'x'; old_length]).unwrap();
+            let offset = startup_log_position(&fs::File::open(&log).unwrap());
+            let archive = paths.logs.join("dsh.err.log.1");
+            fs::rename(&log, &archive).unwrap();
+            fs::write(&log, "Error: dsh: plugin tree failed to load\n").unwrap();
+            let error = startup_failure(&paths, &installation, offset, "DSH 启动进程已退出");
+            assert!(error.contains("插件加载失败"));
+            assert!(!paths.repair_file().exists());
+            fs::remove_file(archive).unwrap();
+        }
+        fs::remove_dir_all(base).unwrap();
     }
 
     fn snapshot(installed: bool, node: bool, npm: bool, running: bool) -> Snapshot {
@@ -4605,7 +4794,7 @@ mod tests {
                 .spawn()
                 .unwrap(),
         );
-        fs::write(mode, child.0.id().to_string()).unwrap();
+        atomic_write(Path::new(&mode), child.0.id().to_string().as_bytes()).unwrap();
         let _ = child.0.wait();
     }
 
@@ -4696,6 +4885,38 @@ mod tests {
             assert!(result.unwrap());
             assert!(parent_gone && child_gone);
         }
+    }
+
+    #[test]
+    fn stopping_an_already_exited_worker_succeeds_but_keeps_live_unknown_processes() {
+        let base = env::temp_dir().join(format!("dsh-stop-race-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let child = TestChild(
+            hidden_command(env::current_exe().unwrap())
+                .args(["--exact", "tests::hidden_process_tree_fixture"])
+                .env("DSH_TEST_PROCESS_TREE", "child")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        fs::write(paths.pid_file(), pid.to_string()).unwrap();
+        assert!(stop_verified_dsh(&paths, pid, Ok(None)).is_err());
+        assert!(process_running(pid).unwrap());
+        force_terminate_process_tree(pid).unwrap();
+        if !tcp_open(DSH_PORT) {
+            assert_eq!(
+                stop_verified_dsh(&paths, pid, Err("process disappeared during query".into()))
+                    .unwrap(),
+                "DSH 已停止"
+            );
+            assert!(!paths.pid_file().exists());
+        }
+        drop(child);
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
