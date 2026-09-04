@@ -108,8 +108,10 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const NPM_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const NPM_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
-// CIM can need several seconds on a cold Windows runner. It never runs on the UI thread.
 const PROCESS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+// PowerShell and CIM can exceed five seconds on a cold Windows machine.
+// Identity queries stay off the UI thread and have their own bounded budget.
+const CIM_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const STOP_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(350);
 const LAUNCHER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2225,7 +2227,7 @@ fn process_command_line(pid: u32) -> Result<Option<String>, String> {
             "-Command",
             &script,
         ]),
-        PROCESS_QUERY_TIMEOUT,
+        CIM_QUERY_TIMEOUT,
     )
     .map_err(|error| format!("无法查询进程命令行：{error}"))?;
     if !status.success() {
@@ -4678,22 +4680,23 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::zombie_processes)]
     fn stale_pid_for_unrelated_process_is_discarded() {
         let base = env::temp_dir().join(format!("dsh-launcher-stale-pid-{}", transaction_nonce()));
         let paths = test_paths(&base);
         paths.ensure_layout().unwrap();
-        let mut unrelated = hidden_command("cmd.exe")
-            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
-            .spawn()
-            .unwrap();
-        fs::write(paths.pid_file(), unrelated.id().to_string()).unwrap();
+        let unrelated = TestChild(
+            hidden_command("cmd.exe")
+                .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+                .spawn()
+                .unwrap(),
+        );
+        fs::write(paths.pid_file(), unrelated.0.id().to_string()).unwrap();
 
         assert!(!tracked_process_running(&paths).unwrap());
         assert!(!paths.pid_file().exists());
+        assert!(process_running(unrelated.0.id()).unwrap());
 
-        let _ = force_terminate_process_tree(unrelated.id());
-        let _ = unrelated.wait();
+        drop(unrelated);
         fs::remove_dir_all(base).unwrap();
     }
 
