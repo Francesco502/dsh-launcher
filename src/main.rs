@@ -2258,6 +2258,28 @@ fn is_dsh_command(command_line: &str, port: u16) -> bool {
     entry && web && explicit_port.map_or(port == DSH_PORT, |value| value == port)
 }
 
+fn process_creation_time_from_cim(pid: u32) -> Option<u64> {
+    let script = format!(
+        "$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' -ErrorAction Stop; if ($null -ne $p.CreationDate) {{ [Console]::Out.Write($p.CreationDate.ToFileTimeUtc()) }}"
+    );
+    let (status, stdout) = short_command_output(
+        hidden_command("powershell.exe").args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &script,
+        ]),
+        CIM_QUERY_TIMEOUT,
+    )
+    .ok()?;
+    status
+        .success()
+        .then(|| String::from_utf8_lossy(&stdout).trim().parse::<u64>().ok())
+        .flatten()
+        .filter(|created| *created > 0)
+}
+
 fn terminate_pid(pid: u32) -> Result<bool, String> {
     terminate_pid_with(pid, |pid| {
         short_command_output(
@@ -2351,6 +2373,37 @@ impl ProcessHandle {
 
 struct ProcessTree(Vec<(u32, ProcessHandle)>);
 
+fn descendant_handle(
+    pid: u32,
+    parent_times: (u64, Option<u64>),
+) -> Result<Option<ProcessHandle>, String> {
+    let child = match ProcessHandle::open(pid) {
+        Ok(child) => child,
+        Err(error) => {
+            // A stale parent PID can link an older protected system process to
+            // this tree. CIM can read its creation time without a terminate handle.
+            // Exclude only proven non-descendants; unknown or real children still fail.
+            if process_creation_time_from_cim(pid).is_some_and(|created| {
+                created.saturating_add(10) < parent_times.0
+                    || parent_times
+                        .1
+                        .is_some_and(|exit| created > exit.saturating_add(10))
+            }) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    };
+    let Some(child) = child else {
+        return Ok(None);
+    };
+    let created = child.times()?.0;
+    Ok(
+        (created >= parent_times.0 && parent_times.1.is_none_or(|exit| created <= exit))
+            .then_some(child),
+    )
+}
+
 impl ProcessTree {
     fn capture(pid: u32) -> Result<Self, String> {
         let mut tree = Self(
@@ -2397,11 +2450,7 @@ impl ProcessTree {
                     continue;
                 };
                 let parent_times = parent.times()?;
-                let Some(child) = ProcessHandle::open(pid)? else {
-                    continue;
-                };
-                let created = child.times()?.0;
-                if created >= parent_times.0 && parent_times.1.is_none_or(|exit| created <= exit) {
+                if let Some(child) = descendant_handle(pid, parent_times)? {
                     self.0.push((pid, child));
                 }
             }
@@ -4920,6 +4969,18 @@ mod tests {
         }
         drop(child);
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn process_tree_rejects_stale_parent_links_to_protected_processes() {
+        let current = ProcessHandle::open(std::process::id()).unwrap().unwrap();
+        // Query only: never terminate a real protected process in this test.
+        // Simulate a stale parent PID linking the older System process to us.
+        assert!(descendant_handle(4, current.times().unwrap())
+            .unwrap()
+            .is_none());
+        // An inaccessible candidate within the parent's lifetime stays an error.
+        assert!(descendant_handle(4, (0, None)).is_err());
     }
 
     #[test]
