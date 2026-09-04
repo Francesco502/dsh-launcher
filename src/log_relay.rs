@@ -7,18 +7,39 @@ use std::process::Stdio;
 use std::thread;
 
 pub(super) fn is_worker(args: &[String]) -> bool {
-    args.len() == 11
-        && args[1] == "--dsh-log-worker"
-        && args[5..] == ["web", "--no-open", "--host", "127.0.0.1", "--port", "3080"]
+    if !matches!(args.len(), 11 | 13) || args[1] != "--dsh-log-worker" || args[5] != "web" {
+        return false;
+    }
+    let tail = if args.len() == 13 {
+        if args[6] != "--patch" || args[7].is_empty() {
+            return false;
+        }
+        &args[8..]
+    } else {
+        &args[6..]
+    };
+    tail == ["--no-open", "--host", "127.0.0.1", "--port", "3080"]
 }
 
-pub(super) fn run(paths: &Paths, node: &Path, entry: &Path) -> Result<i32, String> {
+pub(super) fn run(
+    paths: &Paths,
+    node: &Path,
+    entry: &Path,
+    patch: Option<&Path>,
+) -> Result<i32, String> {
     let mut command = hidden_command(node);
     command
         .arg("--require")
         .arg(paths.state.join("browser-entry.cjs"))
         .arg(entry)
-        .args(["web", "--no-open", "--host", "127.0.0.1", "--port", "3080"]);
+        .arg("web");
+    if let Some(patch) = patch {
+        if patch != paths.state.join("plugin-startup.patch.json") {
+            return Err("插件启动覆盖层路径无效".to_owned());
+        }
+        command.arg("--patch").arg(patch);
+    }
+    command.args(["--no-open", "--host", "127.0.0.1", "--port", "3080"]);
     collect(&mut command, &paths.logs)
 }
 
@@ -348,6 +369,18 @@ mod tests {
         .into();
         assert!(is_worker(&args));
         assert!(crate::parse_action(&args).is_err());
+        let mut with_patch = args.clone();
+        with_patch.splice(
+            6..6,
+            [
+                "--patch".to_owned(),
+                "D:\\测试目录\\plugin-startup.patch.json".to_owned(),
+            ],
+        );
+        assert!(is_worker(&with_patch));
+        assert!(crate::parse_action(&with_patch).is_err());
+        with_patch[6] = "--unexpected".to_owned();
+        assert!(!is_worker(&with_patch));
         args.push("extra".to_owned());
         assert!(!is_worker(&args));
     }

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod log_relay;
+mod plugins;
 
 use std::collections::VecDeque;
 use std::env;
@@ -65,8 +66,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{
     IsUserAnAdmin, SetCurrentProcessExplicitAppUserModelID, ShellExecuteW, Shell_NotifyIconW,
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIM_ADD, NIM_DELETE,
-    NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -130,6 +131,7 @@ const UI_MESSAGE: u32 = WM_APP + 2;
 const SHOW_MESSAGE: u32 = WM_APP + 3;
 const HEALTH_MESSAGE: u32 = WM_APP + 4;
 const OPERATION_MESSAGE: u32 = WM_APP + 5;
+const PLUGINS_MESSAGE: u32 = WM_APP + 6;
 const NIN_KEYSELECT: u32 = 1025;
 const TIMER_TRAY_RETRY: usize = 1;
 const TIMER_HEALTH: usize = 2;
@@ -140,10 +142,12 @@ const CMD_UPDATE_DSH: u32 = 1003;
 const CMD_CHECK_LAUNCHER: u32 = 1004;
 const CMD_SHOW: u32 = 1005;
 const CMD_EXIT: u32 = 1006;
+const CMD_PLUGINS: u32 = 1007;
+const CMD_RESTART: u32 = 1008;
 const ID_TITLE: u32 = 1101;
 const ID_STATUS: u32 = 1102;
 const CLIENT_WIDTH: i32 = 484;
-const CLIENT_HEIGHT: i32 = 351;
+const CLIENT_HEIGHT: i32 = 397;
 const FONT_FAMILY: &str = "Microsoft YaHei UI";
 const BLUE: u32 = rgb(58, 84, 220);
 const BLUE_DARK: u32 = rgb(43, 66, 184);
@@ -429,10 +433,11 @@ struct AppState {
     status: Mutex<String>,
     messages: Mutex<VecDeque<String>>,
     operation_result: Mutex<Option<(Snapshot, Result<String, String>)>>,
+    plugin_result: Mutex<Option<Result<plugins::Catalog, String>>>,
+    plugin_window: AtomicUsize,
     busy: AtomicBool,
     cancelable: AtomicBool,
     refresh: Arc<SnapshotRefresh>,
-    close_notice_shown: AtomicBool,
     high_contrast: AtomicBool,
 }
 
@@ -483,6 +488,7 @@ impl SnapshotRefresh {
 enum Operation {
     Start,
     Stop,
+    Restart,
     Install,
     Upgrade,
 }
@@ -511,7 +517,8 @@ fn main() {
     if log_relay::is_worker(&args) {
         let result = ensure_not_elevated().and_then(|_| {
             let paths = Paths::at_root(Path::new(&args[2]))?;
-            log_relay::run(&paths, Path::new(&args[3]), Path::new(&args[4]))
+            let patch = (args.len() == 13).then(|| Path::new(&args[7]));
+            log_relay::run(&paths, Path::new(&args[3]), Path::new(&args[4]), patch)
         });
         let code = match result {
             Ok(code) => code,
@@ -848,11 +855,15 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
         )
         .arg(&installation.node)
         .arg(&installation.entry)
-        .args(["web", "--no-open", "--host", "127.0.0.1", "--port", "3080"])
+        .arg("web")
         .env_remove(CLI_OUTPUT_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(patch) = plugins::startup_patch(paths, installation)? {
+        command.arg("--patch").arg(patch);
+    }
+    command.args(["--no-open", "--host", "127.0.0.1", "--port", "3080"]);
     if installation.profile == ProfileMode::Portable {
         fs::create_dir_all(&paths.profile)
             .map_err(|error| format!("无法创建便携配置目录：{error}"))?;
@@ -1018,6 +1029,18 @@ fn stop_dsh() -> Result<String, String> {
         }
     };
     stop_verified_dsh(&paths, pid, process_command_line(pid))
+}
+
+fn restart_sequence(
+    stop: impl FnOnce() -> Result<String, String>,
+    start: impl FnOnce() -> Result<String, String>,
+    progress: &dyn Fn(&str, bool),
+) -> Result<String, String> {
+    progress("正在停止 DSH...", false);
+    stop().map_err(|error| format!("重启中止：{error}"))?;
+    progress("正在重新启动 DSH...", false);
+    start().map_err(|error| format!("DSH 已停止，但重新启动失败：{error}"))?;
+    Ok(format!("DSH 已重新启动 · {WEB_URL}"))
 }
 
 fn stop_verified_dsh(
@@ -2685,10 +2708,11 @@ fn run_app() -> Result<(), String> {
         status: Mutex::new(initial_status),
         messages: Mutex::new(VecDeque::new()),
         operation_result: Mutex::new(None),
+        plugin_result: Mutex::new(None),
+        plugin_window: AtomicUsize::new(0),
         busy: AtomicBool::new(false),
         cancelable: AtomicBool::new(false),
         refresh: Arc::new(SnapshotRefresh::default()),
-        close_notice_shown: AtomicBool::new(false),
         high_contrast: AtomicBool::new(high_contrast),
     });
     unsafe { create_main_window(hinstance, state) }
@@ -2748,13 +2772,26 @@ unsafe fn create_main_window(hinstance: *mut c_void, state: Arc<AppState>) -> Re
     ShowWindow(hwnd, SW_SHOW);
     let mut message = MSG::default();
     while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+        if let Some(state) = state_for(hwnd) {
+            let dialog = state.plugin_window.load(Ordering::Acquire) as HWND;
+            if !dialog.is_null() && IsDialogMessageW(dialog, &message) != 0 {
+                continue;
+            }
+        }
         // Owner-drawn buttons do not provide the default-button dialog code.
         // Activate the focused launcher button explicitly for Enter, while
         // leaving Space and Tab to the native button/dialog handling.
         if message.message == WM_KEYDOWN && message.wParam == VK_RETURN as usize {
             let id = GetDlgCtrlID(message.hwnd) as u32;
-            if matches!(id, CMD_MAIN | CMD_WEB | CMD_UPDATE_DSH | CMD_CHECK_LAUNCHER)
-                && message.hwnd == GetDlgItem(hwnd, id as i32)
+            if matches!(
+                id,
+                CMD_MAIN
+                    | CMD_WEB
+                    | CMD_UPDATE_DSH
+                    | CMD_CHECK_LAUNCHER
+                    | CMD_PLUGINS
+                    | CMD_RESTART
+            ) && message.hwnd == GetDlgItem(hwnd, id as i32)
                 && IsWindowEnabled(message.hwnd) != 0
             {
                 if message.lParam & (1 << 30) == 0 {
@@ -2856,6 +2893,8 @@ unsafe extern "system" fn window_proc(
                     }
                 }
                 CMD_UPDATE_DSH => request_operation(hwnd, Operation::Upgrade),
+                CMD_PLUGINS => plugins::request(hwnd),
+                CMD_RESTART => request_operation(hwnd, Operation::Restart),
                 CMD_CHECK_LAUNCHER => request_launcher_check(hwnd),
                 CMD_SHOW => show_main_window(hwnd),
                 CMD_EXIT
@@ -2869,9 +2908,7 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_KEYDOWN if wparam as u16 == VK_ESCAPE => {
-            if let Some(state) = state_for(hwnd) {
-                hide_main_window(hwnd, &state);
-            }
+            hide_main_window(hwnd);
             0
         }
         WM_DRAWITEM => {
@@ -2938,6 +2975,21 @@ unsafe extern "system" fn window_proc(
                         *current = snapshot;
                     }
                     finish_operation(hwnd, &state, result);
+                }
+            }
+            0
+        }
+        PLUGINS_MESSAGE => {
+            if let Some(state) = state_for(hwnd) {
+                let result = state
+                    .plugin_result
+                    .lock()
+                    .ok()
+                    .and_then(|mut value| value.take());
+                match result {
+                    Some(Ok(catalog)) => plugins::open(hwnd, state, catalog),
+                    Some(Err(error)) => finish_operation(hwnd, &state, Err(error)),
+                    None => {}
                 }
             }
             0
@@ -3014,9 +3066,7 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_CLOSE => {
-            if let Some(state) = state_for(hwnd) {
-                hide_main_window(hwnd, &state);
-            }
+            hide_main_window(hwnd);
             0
         }
         WM_DESTROY => {
@@ -3092,6 +3142,22 @@ unsafe fn create_controls(hwnd: HWND) {
     create_control(
         hwnd,
         "BUTTON",
+        "重启 DSH",
+        CMD_RESTART,
+        BS_OWNERDRAW as u32,
+        true,
+    );
+    create_control(
+        hwnd,
+        "BUTTON",
+        "选择插件",
+        CMD_PLUGINS,
+        BS_OWNERDRAW as u32,
+        true,
+    );
+    create_control(
+        hwnd,
+        "BUTTON",
         &format!("v{APP_VERSION} · 检查启动器更新"),
         CMD_CHECK_LAUNCHER,
         BS_OWNERDRAW as u32,
@@ -3139,7 +3205,14 @@ unsafe fn recreate_fonts(hwnd: HWND, state: &AppState) {
         title as usize,
         1,
     );
-    for id in [ID_STATUS, CMD_MAIN, CMD_WEB, CMD_UPDATE_DSH] {
+    for id in [
+        ID_STATUS,
+        CMD_MAIN,
+        CMD_WEB,
+        CMD_UPDATE_DSH,
+        CMD_PLUGINS,
+        CMD_RESTART,
+    ] {
         SendMessageW(GetDlgItem(hwnd, id as i32), WM_SETFONT, body as usize, 1);
     }
     SendMessageW(
@@ -3222,6 +3295,22 @@ unsafe fn layout(hwnd: HWND) {
         hwnd,
         CMD_UPDATE_DSH,
         margin + half + gap,
+        scale(266, dpi),
+        half,
+        scale(40, dpi),
+    );
+    move_control(
+        hwnd,
+        CMD_PLUGINS,
+        margin,
+        scale(266, dpi),
+        half,
+        scale(40, dpi),
+    );
+    move_control(
+        hwnd,
+        CMD_RESTART,
+        margin + half + gap,
         scale(208, dpi),
         half,
         scale(44, dpi),
@@ -3230,7 +3319,7 @@ unsafe fn layout(hwnd: HWND) {
         hwnd,
         CMD_CHECK_LAUNCHER,
         margin,
-        scale(284, dpi),
+        scale(330, dpi),
         content,
         scale(28, dpi),
     );
@@ -3379,6 +3468,14 @@ unsafe fn refresh_controls(hwnd: HWND, state: &AppState) {
         (!busy && snapshot.installation.is_some() && snapshot.npm_available) as i32,
     );
     EnableWindow(GetDlgItem(hwnd, CMD_CHECK_LAUNCHER as i32), (!busy) as i32);
+    EnableWindow(
+        GetDlgItem(hwnd, CMD_PLUGINS as i32),
+        (!busy && snapshot.installation.is_some()) as i32,
+    );
+    EnableWindow(
+        GetDlgItem(hwnd, CMD_RESTART as i32),
+        restart_allowed(&snapshot, busy) as i32,
+    );
     let status = state
         .status
         .lock()
@@ -3393,7 +3490,14 @@ unsafe fn refresh_controls(hwnd: HWND, state: &AppState) {
     state.tray_icon.store(icon, Ordering::Release);
     set_window_icon(hwnd, icon as HICON);
     update_tray(hwnd, icon as HICON, &status);
-    for id in [CMD_MAIN, CMD_WEB, CMD_UPDATE_DSH, CMD_CHECK_LAUNCHER] {
+    for id in [
+        CMD_MAIN,
+        CMD_WEB,
+        CMD_UPDATE_DSH,
+        CMD_CHECK_LAUNCHER,
+        CMD_PLUGINS,
+        CMD_RESTART,
+    ] {
         InvalidateRect(GetDlgItem(hwnd, id as i32), std::ptr::null(), 1);
     }
     // Disabling a focused button clears thread input focus. Keep keyboard
@@ -3401,6 +3505,14 @@ unsafe fn refresh_controls(hwnd: HWND, state: &AppState) {
     if GetFocus().is_null() && GetForegroundWindow() == hwnd && IsWindowEnabled(hwnd) != 0 {
         SetFocus(hwnd);
     }
+}
+
+fn restart_allowed(snapshot: &Snapshot, busy: bool) -> bool {
+    !busy
+        && snapshot.running
+        && snapshot.installation.is_some()
+        && !snapshot.repair_needed
+        && snapshot.discovery_error.is_none()
 }
 
 unsafe fn handle_main_button(hwnd: HWND) {
@@ -3436,6 +3548,16 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
     let Some(state) = state_for(hwnd) else {
         return;
     };
+    if matches!(operation, Operation::Restart) {
+        let snapshot = state
+            .snapshot
+            .lock()
+            .map(|value| value.clone())
+            .unwrap_or_default();
+        if !restart_allowed(&snapshot, state.busy.load(Ordering::Acquire)) {
+            return;
+        }
+    }
     if !state.refresh.initialized.load(Ordering::Acquire) || state.busy.swap(true, Ordering::AcqRel)
     {
         return;
@@ -3465,6 +3587,7 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
         let result = recover_for_use(&state.paths).and_then(|_| match operation {
             Operation::Start => start_dsh(),
             Operation::Stop => stop_dsh(),
+            Operation::Restart => restart_sequence(stop_dsh, start_dsh, &progress),
             Operation::Install => {
                 let confirm = |message: &str| unsafe { confirm_box(hwnd_value as HWND, message) };
                 install_or_update(true, &progress, Some(&confirm))
@@ -3493,14 +3616,13 @@ fn finish_operation(hwnd: HWND, state: &Arc<AppState>, result: Result<String, St
     CANCEL.store(false, Ordering::Release);
     match result {
         Ok(message) => {
-            push_status(hwnd, state, message.clone());
-            unsafe { notify(hwnd, "DSH 操作完成", &message, false) };
+            push_status(hwnd, state, message);
         }
         Err(error) => {
             append_log(&state.paths.logs.join("launcher.log"), &error);
             push_status(hwnd, state, format!("操作失败：{}", first_line(&error)));
             unsafe {
-                notify(hwnd, "DSH 操作失败", first_line(&error), true);
+                notify_error(hwnd, "DSH 操作失败", first_line(&error));
                 show_error_box(
                     hwnd,
                     &format!(
@@ -3625,15 +3747,7 @@ unsafe fn show_main_window(hwnd: HWND) {
     }
 }
 
-unsafe fn hide_main_window(hwnd: HWND, state: &AppState) {
-    if !state.close_notice_shown.swap(true, Ordering::AcqRel) {
-        notify(
-            hwnd,
-            "DSH启动器已隐藏",
-            "左键鲸鱼图标可重新打开，右键可使用快捷菜单。",
-            false,
-        );
-    }
+unsafe fn hide_main_window(hwnd: HWND) {
     KillTimer(hwnd, TIMER_HEALTH);
     ShowWindow(hwnd, SW_HIDE);
 }
@@ -3738,12 +3852,12 @@ unsafe fn delete_tray(hwnd: HWND) {
     Shell_NotifyIconW(NIM_DELETE, &data);
 }
 
-unsafe fn notify(hwnd: HWND, title: &str, message: &str, error: bool) {
+unsafe fn notify_error(hwnd: HWND, title: &str, message: &str) {
     let mut data = notify_data(hwnd, std::ptr::null_mut());
     data.uFlags = NIF_INFO;
     copy_wide(&mut data.szInfoTitle, title);
     copy_wide(&mut data.szInfo, message);
-    data.dwInfoFlags = if error { NIIF_ERROR } else { NIIF_INFO };
+    data.dwInfoFlags = NIIF_ERROR;
     Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 
@@ -4146,13 +4260,71 @@ mod tests {
     }
 
     #[test]
+    fn restart_stops_before_starting_and_preserves_failure_stage() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let result = restart_sequence(
+            || {
+                calls.borrow_mut().push("stop");
+                Ok("stopped".to_owned())
+            },
+            || {
+                calls.borrow_mut().push("start");
+                Ok("started".to_owned())
+            },
+            &|_, _| {},
+        );
+        assert!(result.unwrap().contains("已重新启动"));
+        assert_eq!(*calls.borrow(), vec!["stop", "start"]);
+        let result = restart_sequence(
+            || Err("stop failed".to_owned()),
+            || panic!("must not start after a failed stop"),
+            &|_, _| {},
+        );
+        assert!(result.unwrap_err().contains("重启中止：stop failed"));
+        let result = restart_sequence(
+            || Ok("stopped".to_owned()),
+            || Err("plugin failed".to_owned()),
+            &|_, _| {},
+        );
+        assert!(result
+            .unwrap_err()
+            .contains("DSH 已停止，但重新启动失败：plugin failed"));
+    }
+
+    #[test]
+    fn restart_requires_a_running_service_and_usable_installation() {
+        let mut current = Snapshot {
+            running: true,
+            installation: Some(Installation {
+                source: Source::Managed,
+                node: PathBuf::from("node.exe"),
+                entry: PathBuf::from("bin.js"),
+                version: "0.1.2-rc.1".to_owned(),
+                profile: ProfileMode::Portable,
+            }),
+            ..Snapshot::default()
+        };
+        assert!(restart_allowed(&current, false));
+        assert!(!restart_allowed(&current, true));
+        current.repair_needed = true;
+        assert!(!restart_allowed(&current, false));
+        current.repair_needed = false;
+        current.discovery_error = Some("broken installation".to_owned());
+        assert!(!restart_allowed(&current, false));
+        current.discovery_error = None;
+        current.running = false;
+        assert!(!restart_allowed(&current, false));
+    }
+
+    #[test]
     fn layout_scaling_covers_required_dpi_levels() {
         assert_eq!(scale(100, 96), 100);
         assert_eq!(scale(100, 144), 150);
         assert_eq!(scale(100, 192), 200);
         assert_eq!(desired_client_size(96), (CLIENT_WIDTH, CLIENT_HEIGHT));
-        assert_eq!(desired_client_size(144), (726, 526));
-        assert_eq!(desired_client_size(192), (968, 702));
+        assert_eq!(desired_client_size(144), (726, 595));
+        assert_eq!(desired_client_size(192), (968, 794));
     }
 
     #[test]

@@ -57,6 +57,9 @@ jobs:
       - name: Test local browser entry and request isolation
         run: node --test .github/scripts/test-browser-entry.cjs
 
+      - name: Test plugin selection and startup overrides
+        run: node --test .github/scripts/test-plugin-bridge.cjs
+
       - name: Clippy
         run: cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
@@ -246,6 +249,12 @@ jobs:
             "User-Agent" = "DSH-Launcher-Release"
           }
           $releaseApi = "https://api.github.com/repos/$repository/releases"
+          $versionPattern = [regex]::Escape($env:GITHUB_REF_NAME.Substring(1))
+          $changeLog = Get-Content -LiteralPath "CHANGELOG.md" -Raw
+          $section = [regex]::Match($changeLog, "(?ms)^## \[$versionPattern\][^\r\n]*\r?\n(.*?)(?=^## \[|\z)")
+          if (-not $section.Success) {
+            throw "Release notes are missing from CHANGELOG.md."
+          }
           $releaseMetadata = @{
             tag_name = $env:GITHUB_REF_NAME
             name = $env:GITHUB_REF_NAME
@@ -255,6 +264,8 @@ jobs:
             generate_release_notes = $false
             body = @(
               "DSH Launcher $env:GITHUB_REF_NAME (Windows 10/11 x64; unsigned, authenticode_status: unsigned).",
+              "",
+              $section.Groups[1].Value.Trim(),
               "",
               "CLI compatibility: the public commands are start, stop, upgrade, and open. The removed restart, repair, migrate, launcher-update, data, and --data-dir forms are no longer accepted.",
               "Runtime requirement: DSH-Launcher-Portable-x64.zip is the supported lightweight package and contains no Node.js or DSH runtime. Install Node.js separately when it is absent; DSH installation and upgrades are explicit user actions.",
