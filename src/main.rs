@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod lifecycle;
 mod log_relay;
 mod plugins;
+mod self_update;
 
 use std::collections::VecDeque;
 use std::env;
@@ -101,7 +103,6 @@ const WEB_URL: &str = "http://127.0.0.1:3080/";
 const NODE_DOWNLOAD_URL: &str = "https://nodejs.org/en/download";
 const RELEASE_API_URL: &str =
     "https://api.github.com/repos/Francesco502/dsh-launcher/releases/latest";
-const RELEASE_PAGE_URL: &str = "https://github.com/Francesco502/dsh-launcher/releases/latest";
 const CREATE_NO_WINDOW_FLAG: u32 = CREATE_NO_WINDOW;
 const STILL_ACTIVE_EXIT_CODE: u32 = 259;
 const START_TIMEOUT: Duration = Duration::from_secs(300);
@@ -132,6 +133,7 @@ const SHOW_MESSAGE: u32 = WM_APP + 3;
 const HEALTH_MESSAGE: u32 = WM_APP + 4;
 const OPERATION_MESSAGE: u32 = WM_APP + 5;
 const PLUGINS_MESSAGE: u32 = WM_APP + 6;
+const PROCESS_EXIT_MESSAGE: u32 = WM_APP + 7;
 const NIN_KEYSELECT: u32 = 1025;
 const TIMER_TRAY_RETRY: usize = 1;
 const TIMER_HEALTH: usize = 2;
@@ -372,6 +374,7 @@ struct Snapshot {
     healthy: bool,
     auth_unavailable: bool,
     repair_needed: bool,
+    pending_plugins: bool,
     discovery_error: Option<String>,
 }
 
@@ -431,6 +434,7 @@ struct AppState {
     small_font: AtomicUsize,
     snapshot: Mutex<Snapshot>,
     status: Mutex<String>,
+    sticky_status: AtomicBool,
     messages: Mutex<VecDeque<String>>,
     operation_result: Mutex<Option<(Snapshot, Result<String, String>)>>,
     plugin_result: Mutex<Option<Result<plugins::Catalog, String>>>,
@@ -491,6 +495,7 @@ enum Operation {
     Restart,
     Install,
     Upgrade,
+    Open,
 }
 
 static PATHS: OnceLock<Result<Paths, String>> = OnceLock::new();
@@ -513,7 +518,31 @@ fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    let args: Vec<String> = env::args().collect();
+    let mut args: Vec<String> = env::args().collect();
+    match self_update::internal(&args) {
+        Ok(Some(false)) => return,
+        Ok(Some(true)) => args.truncate(1),
+        Ok(None) => {
+            if args.get(1).is_none_or(|arg| arg != "--dsh-log-worker") {
+                if let Ok(executable) = env::current_exe() {
+                    if let Some(root) = executable.parent() {
+                        match self_update::recover(root) {
+                            Ok(true) => return,
+                            Ok(false) => {}
+                            Err(error) => {
+                                show_error_box(std::ptr::null_mut(), &error);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            write_console(&error, true);
+            std::process::exit(1);
+        }
+    }
     if log_relay::is_worker(&args) {
         let result = ensure_not_elevated().and_then(|_| {
             let paths = Paths::at_root(Path::new(&args[2]))?;
@@ -588,7 +617,9 @@ fn run_release_smoke() -> Result<String, String> {
 
 fn execute_action(action: Action) -> Result<String, String> {
     let paths = app_paths()?;
-    recover_for_use(&paths)?;
+    if action != Action::Stop {
+        recover_for_use(&paths)?;
+    }
     match action {
         Action::Start => start_dsh(),
         Action::Stop => stop_dsh(),
@@ -783,9 +814,17 @@ fn inspect_snapshot(paths: &Paths, installation: Option<Installation>) -> Snapsh
     let probe = probe_dsh(paths);
     let healthy = probe.web_url.is_some();
     let running = tracked || probe.identified;
+    if paths.repair_file().exists()
+        && installation.as_ref().is_some_and(|i| {
+            verify_staged_package(i.entry.parent().unwrap().parent().unwrap(), &i.version).is_ok()
+        })
+    {
+        clear_repair_needed(paths);
+    }
     let repair_needed = paths.repair_file().is_file()
         || (paths.managed_package().exists() && installation.is_none());
     Snapshot {
+        pending_plugins: running && plugins::pending(paths),
         installation,
         node_available,
         npm_available,
@@ -810,7 +849,7 @@ fn refresh_discovery(paths: &Paths) -> Snapshot {
 
 fn start_dsh() -> Result<String, String> {
     let paths = app_paths()?;
-    if paths.repair_file().is_file() {
+    if paths.repair_file().is_file() && discover_installation(&paths)?.is_none() {
         return Err("DSH 最新版本需要重新安装；请先使用“重新安装 DSH”或 upgrade。".to_owned());
     }
     let installation = discover_installation(&paths)?
@@ -878,15 +917,30 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
     let child = command
         .spawn()
         .map_err(|error| format!("无法启动 DSH：{error}"))?;
-    fs::write(paths.pid_file(), child.id().to_string())
-        .map_err(|error| format!("无法记录 DSH 进程：{error}"))?;
+    let owned = ProcessHandle::open(child.id())?.ok_or("启动进程已退出")?;
+    if let Err(error) = atomic_write(&paths.pid_file(), child.id().to_string().as_bytes())
+        .and_then(|_| plugins::record_started(paths, child.id(), &owned))
+    {
+        let _ = terminate_pid(child.id());
+        return Err(format!("无法记录 DSH 进程：{error}"));
+    }
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
+        if CANCEL.load(Ordering::Acquire) {
+            if owned.running()? {
+                terminate_pid(child.id())?;
+            }
+            if owned.running()? {
+                return Err("取消启动后进程仍未退出".to_owned());
+            }
+            let _ = fs::remove_file(paths.pid_file());
+            return Err("操作已取消".to_owned());
+        }
         if probe_dsh(paths).web_url.is_some() {
             clear_repair_needed(paths);
             return Ok(format!("DSH 已启动 · {WEB_URL}"));
         }
-        if !process_running(child.id())? {
+        if !owned.running()? {
             let _ = fs::remove_file(paths.pid_file());
             return Err(startup_failure(
                 paths,
@@ -992,9 +1046,21 @@ fn startup_failure(
             format!("\n涉及插件：{}", plugins.join("、"))
         };
         format!("DSH 插件加载失败；请检查插件与 DSH {} 的兼容性，更新或停用出错插件后重试。重新安装 DSH 不会修复插件。{packages}", installation.version)
-    } else {
+    } else if !installation.entry.is_file() {
         mark_repair_needed(paths, installation);
-        reason.to_owned()
+        "DSH 安装入口缺失，请重新安装 DSH".to_owned()
+    } else if detail.contains("EADDRINUSE") {
+        "3080 端口冲突，请释放端口后重试".to_owned()
+    } else if detail.contains("SyntaxError")
+        || detail.contains("YAML")
+        || detail.contains("configuration")
+    {
+        "DSH 配置解析失败，请检查配置后重试".to_owned()
+    } else if !installation.node.is_file() || detail.contains("NODE_MODULE_VERSION") {
+        "Node 环境不可用或版本不兼容，请检查 Node 后重试".to_owned()
+    } else {
+        clear_repair_needed(paths);
+        format!("{reason}；可重试。请检查本次启动日志")
     };
     format!("{message}\n日志：{}", log.display())
 }
@@ -1028,7 +1094,7 @@ fn stop_dsh() -> Result<String, String> {
             return Ok("DSH 已停止".to_owned());
         }
     };
-    stop_verified_dsh(&paths, pid, process_command_line(pid))
+    stop_verified_dsh(&paths, pid, lifecycle::command_line(pid))
 }
 
 fn restart_sequence(
@@ -1038,8 +1104,14 @@ fn restart_sequence(
 ) -> Result<String, String> {
     progress("正在停止 DSH...", false);
     stop().map_err(|error| format!("重启中止：{error}"))?;
-    progress("正在重新启动 DSH...", false);
-    start().map_err(|error| format!("DSH 已停止，但重新启动失败：{error}"))?;
+    progress("正在重新启动 DSH...", true);
+    start().map_err(|error| {
+        if error == "操作已取消" {
+            error
+        } else {
+            format!("DSH 已停止，但重新启动失败：{error}")
+        }
+    })?;
     Ok(format!("DSH 已重新启动 · {WEB_URL}"))
 }
 
@@ -1061,7 +1133,18 @@ fn stop_verified_dsh(
             "进程 {pid} 不是可验证的 DSH 服务；未停止任何进程。"
         ));
     }
-    let forced = terminate_pid(pid)?;
+    let mut tree = ProcessTree::capture(pid)?;
+    let forced = match lifecycle::graceful_stop(pid)? {
+        Some(true) if tree.finished()? => false,
+        Some(_) => {
+            tree.terminate()?;
+            true
+        }
+        None => terminate_pid(pid)?,
+    };
+    if tcp_open(DSH_PORT) {
+        return Err("进程已退出，但 3080 端口仍在使用，请检查后重试".to_owned());
+    }
     let _ = fs::remove_file(paths.pid_file());
     append_log(
         &paths.logs.join("launcher.log"),
@@ -1155,6 +1238,18 @@ fn install_or_update(
         true,
     );
     let stage = stage_dsh(&paths, &npm, &target_version)?;
+    let staged_installation = Installation {
+        source: Source::Managed,
+        node: find_command("node.exe").ok_or("未找到 Node.js")?,
+        entry: stage.join("node_modules/@deepseek-ai/dsh/lib/bin.js"),
+        version: target_version.clone(),
+        profile: target_profile,
+    };
+    progress("正在预检 Node、配置和插件入口...", true);
+    if let Err(error) = plugins::preflight(&paths, &staged_installation) {
+        let _ = safe_remove_dir(&paths, &stage);
+        return Err(error);
+    }
     if CANCEL.load(Ordering::Acquire) {
         let _ = safe_remove_dir(&paths, &stage);
         return Err("操作已取消".to_owned());
@@ -2187,7 +2282,7 @@ fn tracked_dsh_pid(paths: &Paths) -> Result<Option<u32>, String> {
         let _ = fs::remove_file(paths.pid_file());
         return Ok(None);
     }
-    let Some(command_line) = process_command_line(pid)? else {
+    let Some(command_line) = lifecycle::command_line(pid)? else {
         let _ = fs::remove_file(paths.pid_file());
         return Ok(None);
     };
@@ -2582,42 +2677,6 @@ fn open_url(url: &str) -> Result<(), String> {
     }
 }
 
-fn check_launcher_update(paths: &Paths) -> Result<String, String> {
-    let script = format!(
-        "$ProgressPreference='SilentlyContinue';$r=Invoke-RestMethod -UseBasicParsing -TimeoutSec 15 -Headers @{{'User-Agent'='DSH-Launcher'}} -Uri '{}';[Console]::Out.Write($r.tag_name)",
-        RELEASE_API_URL
-    );
-    let mut command = hidden_command("powershell.exe");
-    command
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            &script,
-        ])
-        .env("TEMP", &paths.temp)
-        .env("TMP", &paths.temp);
-    let output = run_capture(
-        paths,
-        &mut command,
-        "检查启动器更新",
-        LAUNCHER_QUERY_TIMEOUT,
-        false,
-    )?;
-    let latest_text = output.trim().trim_start_matches('v').to_owned();
-    let current =
-        parse_version(APP_VERSION).ok_or_else(|| format!("启动器版本无效：{APP_VERSION}"))?;
-    let latest =
-        parse_version(&latest_text).ok_or_else(|| format!("Release 版本无效：{latest_text}"))?;
-    if latest > current {
-        open_url(RELEASE_PAGE_URL)?;
-        Ok(format!("发现启动器 v{latest_text}，已打开 Release 页面"))
-    } else {
-        Ok(format!("启动器已是最新版本 · v{APP_VERSION}"))
-    }
-}
-
 fn acquire_action_mutex() -> Option<MutexGuard> {
     create_mutex(ACTION_MUTEX)
 }
@@ -2706,6 +2765,7 @@ fn run_app() -> Result<(), String> {
         small_font: AtomicUsize::new(0),
         snapshot: Mutex::new(snapshot),
         status: Mutex::new(initial_status),
+        sticky_status: AtomicBool::new(false),
         messages: Mutex::new(VecDeque::new()),
         operation_result: Mutex::new(None),
         plugin_result: Mutex::new(None),
@@ -2769,7 +2829,9 @@ unsafe fn create_main_window(hinstance: *mut c_void, state: Arc<AppState>) -> Re
         drop(Box::from_raw(state_ptr));
         return Err(format!("无法创建窗口：{}", GetLastError()));
     }
+    lifecycle::set_window(hwnd);
     ShowWindow(hwnd, SW_SHOW);
+    PostMessageW(hwnd, self_update::READY, 0, 0);
     let mut message = MSG::default();
     while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
         if let Some(state) = state_for(hwnd) {
@@ -2884,14 +2946,7 @@ unsafe extern "system" fn window_proc(
             let command = (wparam & 0xffff) as u32;
             match command {
                 CMD_MAIN => handle_main_button(hwnd),
-                CMD_WEB => {
-                    let result = state_for(hwnd)
-                        .ok_or_else(|| "启动器状态不可用".to_owned())
-                        .and_then(|state| open_dsh_web(&state.paths));
-                    if let Err(error) = result {
-                        show_error_box(hwnd, &error);
-                    }
-                }
+                CMD_WEB => request_operation(hwnd, Operation::Open),
                 CMD_UPDATE_DSH => request_operation(hwnd, Operation::Upgrade),
                 CMD_PLUGINS => plugins::request(hwnd),
                 CMD_RESTART => request_operation(hwnd, Operation::Restart),
@@ -3020,11 +3075,41 @@ unsafe extern "system" fn window_proc(
                     if let Ok(mut current) = state.snapshot.lock() {
                         *current = snapshot;
                     }
-                    if let Ok(mut current) = state.status.lock() {
-                        *current = status;
+                    if !state.sticky_status.load(Ordering::Acquire) {
+                        if let Ok(mut current) = state.status.lock() {
+                            *current = status;
+                        }
                     }
                     refresh_controls(hwnd, &state);
                 }
+            }
+            0
+        }
+        self_update::CONFIRM => confirm_box(hwnd, &*(lparam as *const String)) as isize,
+        self_update::READY => {
+            self_update::window_ready();
+            0
+        }
+        self_update::EXIT => {
+            DestroyWindow(hwnd);
+            0
+        }
+        PROCESS_EXIT_MESSAGE => {
+            if !lifecycle::current_exit(wparam) {
+                return 0;
+            }
+            if let Some(state) = state_for(hwnd) {
+                if let Ok(mut snapshot) = state.snapshot.lock() {
+                    snapshot.running = false;
+                    snapshot.healthy = false;
+                    snapshot.auth_unavailable = false;
+                    if !state.sticky_status.load(Ordering::Acquire) {
+                        if let Ok(mut status) = state.status.lock() {
+                            *status = status_for_snapshot(&snapshot);
+                        }
+                    }
+                }
+                refresh_controls(hwnd, &state);
             }
             0
         }
@@ -3070,6 +3155,7 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_DESTROY => {
+            lifecycle::set_window(std::ptr::null_mut());
             if let Some(state) = state_for(hwnd) {
                 KillTimer(hwnd, TIMER_TRAY_RETRY);
                 KillTimer(hwnd, TIMER_HEALTH);
@@ -3476,11 +3562,14 @@ unsafe fn refresh_controls(hwnd: HWND, state: &AppState) {
         GetDlgItem(hwnd, CMD_RESTART as i32),
         restart_allowed(&snapshot, busy) as i32,
     );
-    let status = state
+    let mut status = state
         .status
         .lock()
         .map(|value| value.clone())
         .unwrap_or_default();
+    if snapshot.pending_plugins && !busy && !status.contains("待") {
+        status.push_str("\n插件设置已保存，待重启");
+    }
     set_text(GetDlgItem(hwnd, ID_STATUS as i32), &status);
     let icon = if snapshot.healthy {
         state.blue_icon.load(Ordering::Acquire)
@@ -3563,7 +3652,11 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
         return;
     }
     state.refresh.generation.fetch_add(1, Ordering::AcqRel);
-    let cancelable = matches!(operation, Operation::Install | Operation::Upgrade);
+    state.sticky_status.store(false, Ordering::Release);
+    let cancelable = matches!(
+        operation,
+        Operation::Start | Operation::Install | Operation::Upgrade
+    );
     state.cancelable.store(cancelable, Ordering::Release);
     CANCEL.store(false, Ordering::Release);
     refresh_controls(hwnd, &state);
@@ -3584,16 +3677,28 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
             state.cancelable.store(cancelable, Ordering::Release);
             push_status(hwnd_value as HWND, &state, message.to_owned());
         };
-        let result = recover_for_use(&state.paths).and_then(|_| match operation {
-            Operation::Start => start_dsh(),
+        let recovery = if matches!(
+            operation,
+            Operation::Stop | Operation::Restart | Operation::Open
+        ) {
+            Ok(())
+        } else {
+            recover_for_use(&state.paths)
+        };
+        let result = recovery.and_then(|_| match operation {
+            Operation::Start => {
+                progress("正在准备配置并启动 DSH，可取消...", true);
+                start_dsh()
+            }
             Operation::Stop => stop_dsh(),
+            Operation::Open => open_dsh_web(&state.paths),
             Operation::Restart => restart_sequence(stop_dsh, start_dsh, &progress),
             Operation::Install => {
-                let confirm = |message: &str| unsafe { confirm_box(hwnd_value as HWND, message) };
+                let confirm = |message: &str| self_update::confirm(hwnd_value as HWND, message);
                 install_or_update(true, &progress, Some(&confirm))
             }
             Operation::Upgrade => {
-                let confirm = |message: &str| unsafe { confirm_box(hwnd_value as HWND, message) };
+                let confirm = |message: &str| self_update::confirm(hwnd_value as HWND, message);
                 install_or_update(false, &progress, Some(&confirm))
             }
         });
@@ -3610,6 +3715,9 @@ fn post_operation_result(hwnd: HWND, state: &Arc<AppState>, result: Result<Strin
 }
 
 fn finish_operation(hwnd: HWND, state: &Arc<AppState>, result: Result<String, String>) {
+    state
+        .sticky_status
+        .store(result.is_err(), Ordering::Release);
     // Dialogs and controls belong to the window thread. Keep exit disabled
     // until the modal error dialog is dismissed and all UI work is complete.
     state.cancelable.store(false, Ordering::Release);
@@ -3618,9 +3726,16 @@ fn finish_operation(hwnd: HWND, state: &Arc<AppState>, result: Result<String, St
         Ok(message) => {
             push_status(hwnd, state, message);
         }
+        Err(error) if error == "操作已取消" => {
+            push_status(hwnd, state, error);
+        }
         Err(error) => {
             append_log(&state.paths.logs.join("launcher.log"), &error);
-            push_status(hwnd, state, format!("操作失败：{}", first_line(&error)));
+            push_status(
+                hwnd,
+                state,
+                format!("操作失败：{}", truncate(first_line(&error), 48)),
+            );
             unsafe {
                 notify_error(hwnd, "DSH 操作失败", first_line(&error));
                 show_error_box(
@@ -3646,18 +3761,29 @@ unsafe fn request_launcher_check(hwnd: HWND) {
         return;
     }
     state.refresh.generation.fetch_add(1, Ordering::AcqRel);
+    CANCEL.store(false, Ordering::Release);
+    state.cancelable.store(true, Ordering::Release);
     refresh_controls(hwnd, &state);
     push_status(hwnd, &state, "正在检查启动器更新...".to_owned());
     let hwnd_value = hwnd as usize;
     thread::spawn(move || {
-        let result = check_launcher_update(&state.paths);
-        state.busy.store(false, Ordering::Release);
+        let result = (|| {
+            let _guard = acquire_action_mutex().ok_or("已有启动器操作正在执行")?;
+            self_update::prepare(&state.paths, hwnd_value as HWND, &|message, cancelable| {
+                state.cancelable.store(cancelable, Ordering::Release);
+                push_status(hwnd_value as HWND, &state, message.to_owned());
+            })
+        })();
         match result {
-            Ok(message) => push_status(hwnd_value as HWND, &state, message),
-            Err(error) => {
-                append_log(&state.paths.logs.join("launcher.log"), &error);
-                push_status(hwnd_value as HWND, &state, format!("检查失败：{error}"));
+            Ok(true) => {
+                PostMessageW(hwnd_value as HWND, self_update::EXIT, 0, 0);
             }
+            Ok(false) => post_operation_result(
+                hwnd_value as HWND,
+                &state,
+                Ok(format!("启动器已是最新版本 · v{APP_VERSION}")),
+            ),
+            Err(error) => post_operation_result(hwnd_value as HWND, &state, Err(error)),
         }
     });
 }
@@ -4160,6 +4286,7 @@ mod tests {
             healthy: running,
             auth_unavailable: false,
             repair_needed: false,
+            pending_plugins: false,
             discovery_error: None,
         }
     }

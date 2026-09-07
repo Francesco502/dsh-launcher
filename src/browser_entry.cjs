@@ -2,6 +2,24 @@
 // issues its own signed cookie; this changes only a local browser's root 401.
 const { Server } = require('node:http');
 
+// This pipe is inherited only by the launcher-owned child, never a TCP endpoint.
+if (process.env.DSH_LAUNCHER_STOP_PIPE === '1') {
+  delete process.env.DSH_LAUNCHER_STOP_PIPE;
+  let request = '';
+  let stopped = false;
+  process.stdin.on('data', chunk => {
+    if (stopped) return;
+    request += chunk.toString();
+    if (request.length > 64) { stopped = true; return; }
+    if (request === 'DSH_LAUNCHER_STOP\n') {
+      stopped = true;
+      if (process.listenerCount('SIGTERM')) process.emit('SIGTERM');
+    }
+  });
+  process.stdin.on('error', () => {});
+  process.stdin.unref?.();
+}
+
 let entry;
 let pending = '';
 const stdoutWrite = process.stdout.write;

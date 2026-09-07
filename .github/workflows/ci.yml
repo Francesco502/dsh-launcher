@@ -61,6 +61,9 @@ jobs:
       - name: Test plugin selection and startup overrides
         run: node --test .github/scripts/test-plugin-bridge.cjs
 
+      - name: Test private graceful stop pipe
+        run: node --test .github/scripts/test-stop-pipe.cjs
+
       - name: Clippy GNU target
         run: cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
@@ -108,6 +111,11 @@ jobs:
           & .github\scripts\prepare-portable.ps1 `
             -LauncherPath "$releaseDir\dsh-launcher.exe" `
             -OutputZip "dist\DSH-Launcher-Portable-x64.zip"
+
+      - name: Verify self-update download integrity
+        shell: pwsh
+        run: |
+          & .github\scripts\test-launcher-download.ps1 -LauncherPath target\x86_64-pc-windows-gnu\release\dsh-launcher.exe -WorkDirectory .tmp-update-download
 
       - name: Smoke test portable bundle
         shell: pwsh

@@ -60,6 +60,9 @@ jobs:
       - name: Test plugin selection and startup overrides
         run: node --test .github/scripts/test-plugin-bridge.cjs
 
+      - name: Test private graceful stop pipe
+        run: node --test .github/scripts/test-stop-pipe.cjs
+
       - name: Clippy
         run: cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
@@ -103,6 +106,11 @@ jobs:
           & .github\scripts\prepare-portable.ps1 `
             -LauncherPath "target\x86_64-pc-windows-gnu\release\dsh-launcher.exe" `
             -OutputZip "dist\DSH-Launcher-Portable-x64.zip"
+
+      - name: Verify self-update download integrity
+        shell: pwsh
+        run: |
+          & .github\scripts\test-launcher-download.ps1 -LauncherPath target\x86_64-pc-windows-gnu\release\dsh-launcher.exe -WorkDirectory .tmp-update-download
 
       - name: Smoke test extracted lightweight bundle
         shell: pwsh
@@ -176,6 +184,7 @@ jobs:
           $tagVersion = $env:GITHUB_REF_NAME.Substring(1)
           $manifest = [ordered]@{
             schema_version = 1
+            self_update_protocol = 1
             project = "Francesco502/dsh-launcher"
             version = $tagVersion
             tag = $env:GITHUB_REF_NAME
@@ -269,7 +278,7 @@ jobs:
               "",
               "CLI compatibility: the public commands are start, stop, upgrade, and open. The removed restart, repair, migrate, launcher-update, data, and --data-dir forms are no longer accepted.",
               "Runtime requirement: DSH-Launcher-Portable-x64.zip is the supported lightweight package and contains no Node.js or DSH runtime. Install Node.js separately when it is absent; DSH installation and upgrades are explicit user actions.",
-              "Launcher updates: use the footer Check for launcher updates action to compare the official GitHub Release version and open the release page, then download and replace the launcher from that release manually.",
+              "Launcher updates: use the footer Check for launcher updates action, confirm the newer release, then let the launcher download, verify and transactionally replace the four portable program files. Failed readiness restores the old file group; DSH and user data remain intact. The first upgrade from 0.3.3 to 0.4.0 still requires installing the full portable bundle.",
               "DSH-Launcher.exe is a technical asset and is not a standalone portable package."
             ) -join "`n"
           }

@@ -146,6 +146,7 @@ $runtimeManifest = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'run
         $manifestPath = Join-Path $releasePath 'release-manifest.json'
         $releaseManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
         if ($releaseManifest.schema_version -ne 1 -or
+            $releaseManifest.self_update_protocol -ne 1 -or
             $releaseManifest.project -ne 'Francesco502/dsh-launcher' -or
             $releaseManifest.version -ne $package.version -or
             $releaseManifest.tag -ne $Tag -or

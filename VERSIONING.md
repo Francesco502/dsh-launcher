@@ -91,7 +91,7 @@ cargo metadata --locked --no-deps --format-version 1
 
 Release manifest 必须包含 `authenticode_status: "unsigned"`。`release-manifest.json` 本身不放入自己的 `assets` 哈希数组，因为这样会形成自引用；其余五个资产必须逐一列出并校验。正式 Release 的 `commit` 必须是标签提交的 40 位 SHA；未提交工作树只能在本地显式验证模式下使用 `local-working-tree` 占位值。
 
-`release-manifest.json` 的当前 schema 为 `1`，至少包含：
+`release-manifest.json` 的当前 schema 为 `1`；从 0.4.0 起增加向后兼容字段 `self_update_protocol: 1`，至少包含：
 
 ```json
 {

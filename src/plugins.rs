@@ -16,6 +16,7 @@ const LIST: u32 = 1201;
 const SAVE: u32 = 1202;
 const CANCEL_BUTTON: u32 = 1203;
 const HELP: u32 = 1204;
+const SAVED: u32 = WM_APP + 40;
 
 #[derive(Clone)]
 pub(super) struct Plugin {
@@ -23,33 +24,89 @@ pub(super) struct Plugin {
     version: String,
     enabled: bool,
     supported: bool,
+    aliases: Vec<String>,
+    conflict: bool,
+    reason: String,
 }
 
 pub(super) struct Catalog {
     key: String,
     plugins: Vec<Plugin>,
+    previous_status: Option<String>,
 }
 
 fn settings_path(paths: &Paths) -> PathBuf {
     paths.state.join("plugin-settings.json")
 }
 
+pub(super) fn record_started(
+    paths: &Paths,
+    pid: u32,
+    process: &ProcessHandle,
+) -> Result<(), String> {
+    let settings: serde_json::Value = fs::read(settings_path(paths))
+        .ok()
+        .and_then(|v| serde_json::from_slice(&v).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let value = serde_json::json!({"pid":pid, "created":process.times()?.0, "image":lifecycle::image(process)?, "settings":settings});
+    atomic_write(
+        &paths.state.join("dsh-session.json"),
+        &serde_json::to_vec(&value).unwrap(),
+    )
+}
+pub(super) fn pending(paths: &Paths) -> bool {
+    let record: Option<serde_json::Value> = fs::read(paths.state.join("dsh-session.json"))
+        .ok()
+        .and_then(|v| serde_json::from_slice(&v).ok());
+    let current: serde_json::Value = fs::read(settings_path(paths))
+        .ok()
+        .and_then(|v| serde_json::from_slice(&v).ok())
+        .unwrap_or(serde_json::Value::Null);
+    record.is_some_and(|record| {
+        record["pid"].as_u64() == read_tracked_pid(paths).map(u64::from)
+            && record["settings"] != current
+    })
+}
+
 fn inspect(paths: &Paths, installation: &Installation) -> Result<serde_json::Value, String> {
+    inspect_settings(paths, installation, &settings_path(paths))
+}
+
+fn inspect_settings(
+    paths: &Paths,
+    installation: &Installation,
+    settings: &Path,
+) -> Result<serde_json::Value, String> {
+    inspect_mode(paths, installation, settings, false)
+}
+fn inspect_mode(
+    paths: &Paths,
+    installation: &Installation,
+    settings: &Path,
+    preflight: bool,
+) -> Result<serde_json::Value, String> {
     let bridge = paths.state.join("plugin-bridge.cjs");
     if fs::read(&bridge).ok().as_deref() != Some(BRIDGE) {
         atomic_write(&bridge, BRIDGE)?;
     }
     let mut command = hidden_command(&installation.node);
-    command
-        .arg(bridge)
-        .arg(&installation.entry)
-        .arg(settings_path(paths));
+    command.arg(bridge).arg(&installation.entry).arg(settings);
     if installation.profile == ProfileMode::Portable {
         command.arg(&paths.profile);
+        command.env("DSH_HOME", &paths.profile);
+    } else {
+        command.arg("");
+    }
+    if preflight {
+        command.arg("preflight");
     }
     command.env("TEMP", &paths.temp).env("TMP", &paths.temp);
-    let output = run_capture(paths, &mut command, "读取插件配置", QUERY_TIMEOUT, false)?;
+    let output = run_capture(paths, &mut command, "读取插件配置", QUERY_TIMEOUT, true)?;
     serde_json::from_str(&output).map_err(|error| format!("插件列表格式无效：{error}"))
+}
+
+pub(super) fn preflight(paths: &Paths, installation: &Installation) -> Result<(), String> {
+    inspect_mode(paths, installation, &settings_path(paths), true).map(|_| ())
 }
 
 pub(super) fn startup_patch(
@@ -88,9 +145,24 @@ fn catalog(paths: &Paths, installation: &Installation) -> Result<Catalog, String
             version: row["version"].as_str().unwrap_or("未知版本").to_owned(),
             enabled: row["enabled"].as_bool().ok_or("插件开关无效")?,
             supported: row["supported"].as_bool().unwrap_or(false),
+            aliases: row["aliases"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            conflict: row["conflict"].as_bool().unwrap_or(false),
+            reason: row["reason"].as_str().unwrap_or("").to_owned(),
         });
     }
-    Ok(Catalog { key, plugins })
+    Ok(Catalog {
+        key,
+        plugins,
+        previous_status: None,
+    })
 }
 
 pub(super) unsafe fn request(hwnd: HWND) {
@@ -103,13 +175,16 @@ pub(super) unsafe fn request(hwnd: HWND) {
     }
     state.refresh.generation.fetch_add(1, Ordering::AcqRel);
     refresh_controls(hwnd, &state);
+    let previous_status = state.status.lock().map(|v| v.clone()).unwrap_or_default();
     push_status(hwnd, &state, "正在读取插件列表...".to_owned());
     let owner = hwnd as usize;
     thread::spawn(move || {
         let result = (|| {
             let _guard = acquire_action_mutex().ok_or("已有启动器操作正在执行")?;
             let installation = discover_installation(&state.paths)?.ok_or("请先安装 DSH")?;
-            catalog(&state.paths, &installation)
+            let mut catalog = catalog(&state.paths, &installation)?;
+            catalog.previous_status = Some(previous_status);
+            Ok(catalog)
         })();
         if let Ok(mut pending) = state.plugin_result.lock() {
             *pending = Some(result);
@@ -125,6 +200,7 @@ struct Dialog {
     initializing: AtomicBool,
     font: AtomicUsize,
     saved: AtomicBool,
+    saving: AtomicBool,
 }
 
 pub(super) unsafe fn open(owner: HWND, state: Arc<AppState>, catalog: Catalog) {
@@ -151,6 +227,7 @@ pub(super) unsafe fn open(owner: HWND, state: Arc<AppState>, catalog: Catalog) {
         initializing: AtomicBool::new(true),
         font: AtomicUsize::new(0),
         saved: AtomicBool::new(false),
+        saving: AtomicBool::new(false),
     }));
     let dpi = GetDpiForWindow(owner).max(96);
     let window = CreateWindowExW(
@@ -189,7 +266,7 @@ unsafe extern "system" fn dialog_proc(
     if message == WM_NCCREATE {
         let create = &*(lparam as *const CREATESTRUCTW);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
-        return 1;
+        return DefWindowProcW(hwnd, message, wparam, lparam);
     }
     let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Dialog;
     if pointer.is_null() {
@@ -235,15 +312,29 @@ unsafe extern "system" fn dialog_proc(
                     iItem: index as i32,
                     pszText: name.as_mut_ptr(),
                     stateMask: LVIS_STATEIMAGEMASK,
-                    state: if plugin.enabled { 2 << 12 } else { 1 << 12 },
+                    state: if !plugin.supported {
+                        0
+                    } else if plugin.enabled {
+                        2 << 12
+                    } else {
+                        1 << 12
+                    },
                     ..LVITEMW::default()
                 };
                 SendMessageW(list, LVM_INSERTITEMW, 0, &item as *const _ as isize);
                 SendMessageW(list, LVM_SETITEMSTATE, index, &item as *const _ as isize);
-                let mut version = to_wide(&if plugin.supported {
+                let mut version = to_wide(&if plugin.reason.is_empty() {
                     plugin.version.clone()
                 } else {
-                    "不支持直接切换".to_owned()
+                    format!(
+                        "{} · {}",
+                        if plugin.enabled {
+                            "已启用"
+                        } else {
+                            "已停用"
+                        },
+                        plugin.reason
+                    )
                 });
                 let item = LVITEMW {
                     iSubItem: 1,
@@ -258,7 +349,7 @@ unsafe extern "system" fn dialog_proc(
                 if dialog.catalog.plugins.is_empty() {
                     "当前 profile 没有已安装的第三方插件。"
                 } else {
-                    "勾选要启用的插件，停止 DSH 后保存，下次启动生效。不兼容插件请保持停用。"
+                    "勾选后保存，下次启动生效；运行中的 DSH 需要手动重启。无复选框的项目受配置限制。"
                 },
                 HELP,
                 0,
@@ -310,33 +401,55 @@ unsafe extern "system" fn dialog_proc(
         }
         WM_COMMAND => {
             match (wparam & 0xffff) as u32 {
-                SAVE => match save(hwnd, dialog) {
-                    Ok(()) => {
-                        dialog.saved.store(true, Ordering::Release);
-                        push_status(
-                            dialog.owner,
-                            &dialog.state,
-                            "插件设置已保存，下次启动生效".to_owned(),
-                        );
-                        DestroyWindow(hwnd);
-                    }
-                    Err(error) => show_error_box(hwnd, &error),
-                },
-                CANCEL_BUTTON | 2 => {
+                SAVE => save(hwnd, dialog),
+                CANCEL_BUTTON | 2 if !dialog.saving.load(Ordering::Acquire) => {
                     DestroyWindow(hwnd);
                 }
                 _ => {}
             }
             0
         }
+        SAVED => {
+            let result = *Box::from_raw(lparam as *mut Result<(), String>);
+            dialog.saving.store(false, Ordering::Release);
+            match result {
+                Ok(()) => {
+                    dialog.saved.store(true, Ordering::Release);
+                    dialog.state.sticky_status.store(true, Ordering::Release);
+                    push_status(
+                        dialog.owner,
+                        &dialog.state,
+                        "插件设置已保存，待下次启动 / 重启生效".to_owned(),
+                    );
+                    DestroyWindow(hwnd);
+                }
+                Err(error) => {
+                    EnableWindow(GetDlgItem(hwnd, SAVE as i32), 1);
+                    EnableWindow(GetDlgItem(hwnd, CANCEL_BUTTON as i32), 1);
+                    EnableWindow(GetDlgItem(hwnd, LIST as i32), 1);
+                    show_error_box(hwnd, &error);
+                }
+            }
+            0
+        }
         WM_CLOSE => {
-            DestroyWindow(hwnd);
+            if !dialog.saving.load(Ordering::Acquire) {
+                DestroyWindow(hwnd);
+            }
             0
         }
         WM_DESTROY => {
             if !dialog.saved.load(Ordering::Acquire) {
                 if let Ok(snapshot) = dialog.state.snapshot.lock() {
-                    push_status(dialog.owner, &dialog.state, status_for_snapshot(&snapshot));
+                    push_status(
+                        dialog.owner,
+                        &dialog.state,
+                        dialog
+                            .catalog
+                            .previous_status
+                            .clone()
+                            .unwrap_or_else(|| status_for_snapshot(&snapshot)),
+                    );
                 }
             }
             dialog.state.plugin_window.store(0, Ordering::Release);
@@ -419,27 +532,59 @@ unsafe fn dialog_layout(hwnd: HWND) {
     );
 }
 
-unsafe fn save(hwnd: HWND, dialog: &Dialog) -> Result<(), String> {
-    let _guard = acquire_action_mutex().ok_or("已有启动器操作正在执行")?;
-    if tracked_process_running(&dialog.state.paths)? || tcp_open(DSH_PORT) {
-        return Err("DSH 已启动，请停止后再保存插件设置。".to_owned());
+unsafe fn save(hwnd: HWND, dialog: &Dialog) {
+    if dialog.saving.swap(true, Ordering::AcqRel) {
+        return;
     }
     let mut choices = serde_json::Map::new();
     let list = GetDlgItem(hwnd, LIST as i32);
     for (index, plugin) in dialog.catalog.plugins.iter().enumerate() {
         if plugin.supported {
             let flags = SendMessageW(list, LVM_GETITEMSTATE, index, LVIS_STATEIMAGEMASK as isize);
-            choices.insert(
-                plugin.name.clone(),
-                serde_json::Value::Bool(flags & LVIS_STATEIMAGEMASK as isize == 2 << 12),
-            );
+            let enabled = flags & LVIS_STATEIMAGEMASK as isize == 2 << 12;
+            if enabled != plugin.enabled || plugin.conflict {
+                for name in &plugin.aliases {
+                    choices.insert(name.clone(), serde_json::Value::Bool(enabled));
+                }
+            }
         }
     }
-    write_choices(
-        &settings_path(&dialog.state.paths),
-        &dialog.catalog.key,
-        choices,
-    )
+    for id in [SAVE, CANCEL_BUTTON, LIST] {
+        EnableWindow(GetDlgItem(hwnd, id as i32), 0);
+    }
+    let state = Arc::clone(&dialog.state);
+    let key = dialog.catalog.key.clone();
+    let window = hwnd as usize;
+    thread::spawn(move || {
+        let result = (|| {
+            let _guard = acquire_action_mutex().ok_or("已有启动器操作正在执行")?;
+            if choices.is_empty() {
+                return Ok(());
+            }
+            let file = settings_path(&state.paths);
+            let candidate = state.paths.state.join("plugin-settings.pending.json");
+            if file.exists() {
+                fs::copy(&file, &candidate).map_err(|e| e.to_string())?;
+            } else {
+                atomic_write(&candidate, b"{\"profiles\":{}}")?;
+            }
+            let checked = (|| {
+                write_choices(&candidate, &key, choices)?;
+                let installation = discover_installation(&state.paths)?.ok_or("请先安装 DSH")?;
+                let value = inspect_settings(&state.paths, &installation, &candidate)?;
+                if let Some(error) = value["error"].as_str() {
+                    return Err(error.to_owned());
+                }
+                atomic_write(&file, &fs::read(&candidate).map_err(|e| e.to_string())?)
+            })();
+            let _ = fs::remove_file(candidate);
+            checked
+        })();
+        let pointer = Box::into_raw(Box::new(result));
+        if PostMessageW(window as HWND, SAVED, 0, pointer as isize) == 0 {
+            drop(Box::from_raw(pointer));
+        }
+    });
 }
 
 fn write_choices(
@@ -457,7 +602,11 @@ fn write_choices(
         .get_mut("profiles")
         .and_then(serde_json::Value::as_object_mut)
         .ok_or("插件设置格式无效")?;
-    profiles.insert(key.to_owned(), serde_json::Value::Object(choices));
+    let profile = profiles
+        .entry(key.to_owned())
+        .or_insert_with(|| serde_json::json!({}));
+    let profile = profile.as_object_mut().ok_or("插件 profile 设置格式无效")?;
+    profile.extend(choices);
     atomic_write(
         file,
         serde_json::to_string_pretty(&settings).unwrap().as_bytes(),
@@ -469,6 +618,184 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "opens real Win32 windows; run alone in an interactive desktop"]
+    fn real_dialog_lifetime_stress() {
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        unsafe fn counters() -> (usize, u32) {
+            let mut memory = PROCESS_MEMORY_COUNTERS_EX::default();
+            let size = std::mem::size_of_val(&memory) as u32;
+            memory.cb = size;
+            assert_ne!(
+                K32GetProcessMemoryInfo(
+                    GetCurrentProcess(),
+                    (&mut memory as *mut PROCESS_MEMORY_COUNTERS_EX).cast(),
+                    size
+                ),
+                0
+            );
+            let mut handles = 0;
+            assert_ne!(GetProcessHandleCount(GetCurrentProcess(), &mut handles), 0);
+            (memory.PrivateUsage, handles)
+        }
+        let root = env::temp_dir().join(format!("dsh-dialog-stress-{}", transaction_nonce()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(PORTABLE_MARKER), b"").unwrap();
+        fs::write(root.join(MANIFEST_FILE), MANIFEST_TEXT).unwrap();
+        let state = Arc::new(AppState {
+            paths: Paths::at_root(&root).unwrap(),
+            blue_icon: AtomicUsize::new(0),
+            black_icon: AtomicUsize::new(0),
+            tray_icon: AtomicUsize::new(0),
+            tray_added: AtomicBool::new(false),
+            taskbar_created: 0,
+            background_brush: 0,
+            control_background_brush: AtomicUsize::new(0),
+            title_font: AtomicUsize::new(0),
+            body_font: AtomicUsize::new(0),
+            small_font: AtomicUsize::new(0),
+            snapshot: Mutex::new(Snapshot::default()),
+            status: Mutex::new(String::new()),
+            sticky_status: AtomicBool::new(false),
+            messages: Mutex::new(VecDeque::new()),
+            operation_result: Mutex::new(None),
+            plugin_result: Mutex::new(None),
+            plugin_window: AtomicUsize::new(0),
+            busy: AtomicBool::new(false),
+            cancelable: AtomicBool::new(false),
+            refresh: Arc::new(SnapshotRefresh::default()),
+            high_contrast: AtomicBool::new(false),
+        });
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                to_wide("STATIC").as_ptr(),
+                to_wide("DSH plugin dialog lifetime test").as_ptr(),
+                WS_OVERLAPPED | WS_CAPTION | WS_VISIBLE,
+                100,
+                100,
+                500,
+                400,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                std::ptr::null(),
+            );
+            assert!(!owner.is_null());
+            let cycle = || {
+                let catalog = Catalog {
+                    key: "portable:web".to_owned(),
+                    previous_status: None,
+                    plugins: vec![Plugin {
+                        name: "fixture".to_owned(),
+                        version: "1.0.0".to_owned(),
+                        enabled: true,
+                        supported: true,
+                        aliases: vec!["fixture".to_owned()],
+                        conflict: false,
+                        reason: String::new(),
+                    }],
+                };
+                open(owner, Arc::clone(&state), catalog);
+                let dialog = state.plugin_window.load(Ordering::Acquire) as HWND;
+                assert!(!dialog.is_null());
+                let mut title = [0u16; 64];
+                let length = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                    dialog,
+                    title.as_mut_ptr(),
+                    64,
+                );
+                assert_eq!(
+                    String::from_utf16_lossy(&title[..length as usize]),
+                    "选择插件"
+                );
+                DestroyWindow(dialog);
+                assert_eq!(state.plugin_window.load(Ordering::Acquire), 0);
+                assert_eq!(Arc::strong_count(&state), 1);
+                let mut message = MSG::default();
+                while windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                    &mut message,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    1,
+                ) != 0
+                {
+                    TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+            };
+            for _ in 0..5 {
+                cycle();
+            }
+            let before = counters();
+            for _ in 0..50 {
+                cycle();
+            }
+            let middle = counters();
+            for _ in 0..50 {
+                cycle();
+            }
+            let after = counters();
+            let value = serde_json::json!({"cycles":100,"privateBefore":before.0,"privateAfter":after.0,"handlesBefore":before.1,"handlesMiddle":middle.1,"handlesAfter":after.1});
+            println!("{value}");
+            assert!(after.0 <= before.0 + 2 * 1024 * 1024);
+            assert!(after.1 <= middle.1 + 1);
+            DestroyWindow(owner);
+            // Exercise the actual main-window message handlers without network work.
+            state.busy.store(true, Ordering::Release);
+            state.cancelable.store(true, Ordering::Release);
+            state.refresh.initialized.store(true, Ordering::Release);
+            let class_name = to_wide("DSH.Test.MainWindow");
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(window_proc),
+                hInstance: GetModuleHandleW(std::ptr::null()),
+                lpszClassName: class_name.as_ptr(),
+                ..WNDCLASSEXW::default()
+            };
+            RegisterClassExW(&class);
+            let pointer = Box::into_raw(Box::new(Arc::clone(&state)));
+            let window = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                to_wide("DSH message response test").as_ptr(),
+                WS_OVERLAPPED | WS_CAPTION | WS_VISIBLE,
+                100,
+                100,
+                500,
+                440,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                GetModuleHandleW(std::ptr::null()),
+                pointer.cast(),
+            );
+            assert!(!window.is_null());
+            let begin = Instant::now();
+            SendMessageW(window, WM_COMMAND, CMD_MAIN as usize, 0);
+            let response = begin.elapsed();
+            assert!(CANCEL.load(Ordering::Acquire));
+            assert!(response < Duration::from_millis(100));
+            SendMessageW(window, WM_CLOSE, 0, 0);
+            assert_eq!(IsWindowVisible(window), 0);
+            state.busy.store(false, Ordering::Release);
+            CANCEL.store(false, Ordering::Release);
+            SendMessageW(window, WM_COMMAND, CMD_EXIT as usize, 0);
+            assert_eq!(
+                windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(window),
+                0
+            );
+            println!(
+                "mainFeedbackMicroseconds={} closeHides=true exitDestroys=true",
+                response.as_micros()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn plugin_choices_round_trip_and_preserve_other_profiles() {
         let root = env::temp_dir().join(format!("dsh-plugin-settings-{}", transaction_nonce()));
         fs::create_dir_all(&root).unwrap();
@@ -478,9 +805,17 @@ mod tests {
         };
         write_choices(&file, "portable:web", choices(false)).unwrap();
         write_choices(&file, "user:other", choices(true)).unwrap();
+        write_choices(
+            &file,
+            "portable:web",
+            serde_json::Map::from_iter([("untouched".to_owned(), serde_json::Value::Bool(true))]),
+        )
+        .unwrap();
+        write_choices(&file, "portable:web", choices(false)).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
         assert_eq!(value["profiles"]["portable:web"]["plugin"], false);
         assert_eq!(value["profiles"]["user:other"]["plugin"], true);
+        assert_eq!(value["profiles"]["portable:web"]["untouched"], true);
         fs::write(&file, b"invalid").unwrap();
         assert!(write_choices(&file, "portable:web", choices(true)).is_err());
         assert_eq!(fs::read(&file).unwrap(), b"invalid");

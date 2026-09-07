@@ -43,13 +43,15 @@ pub(super) fn run(
     collect(&mut command, &paths.logs)
 }
 
-fn collect(command: &mut std::process::Command, logs: &Path) -> Result<i32, String> {
+pub(super) fn collect(command: &mut std::process::Command, logs: &Path) -> Result<i32, String> {
+    let stop = super::lifecycle::StopChannel::create()?;
     let out = RotatingLog::open(logs.join("dsh.out.log"), LOG_LIMIT, true)
         .map_err(|error| format!("无法准备 DSH 输出日志：{error}"))?;
     let mut err = RotatingLog::open(logs.join("dsh.err.log"), LOG_LIMIT, false)
         .map_err(|error| format!("无法准备 DSH 错误日志：{error}"))?;
     let mut child = command
-        .stdin(Stdio::null())
+        .env("DSH_LAUNCHER_STOP_PIPE", "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -58,6 +60,8 @@ fn collect(command: &mut std::process::Command, logs: &Path) -> Result<i32, Stri
             let _ = err.write(message.as_bytes());
             message
         })?;
+    let stdin = child.stdin.take().unwrap();
+    let control = stop.forward(&child, stdin);
     let error_log = logs.join("launcher.log");
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -65,6 +69,7 @@ fn collect(command: &mut std::process::Command, logs: &Path) -> Result<i32, Stri
     let out_thread = thread::spawn(move || pump(stdout, out, &error_log));
     let err_thread = thread::spawn(move || pump(stderr, err, &other_error_log));
     let status = child.wait().map_err(|error| error.to_string())?;
+    let _ = control.join();
     for reader in [out_thread, err_thread] {
         reader
             .join()

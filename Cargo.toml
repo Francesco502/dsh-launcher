@@ -1,6 +1,6 @@
 [package]
 name = "dsh-launcher"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 description = "Low-resource Windows tray launcher for DeepSeek Harness"
 license = "MIT"
@@ -24,6 +24,7 @@ windows-sys = { version = "0.60.2", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_ProcessStatus",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_UI_Accessibility",

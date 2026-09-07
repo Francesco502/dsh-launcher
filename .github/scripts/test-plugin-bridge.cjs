@@ -1,6 +1,28 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { planPlugins } = require('../../src/plugin_bridge.cjs');
+const { satisfiesNode } = require('../../src/plugin_bridge.cjs');
+
+test('aliases of one actual bundle share a toggle; conflicting saved aliases fail closed', () => {
+  const records = ['quota', '@scope/quota'].map(name => ({ ...bundle(name, [{ id: 'quota' }]), identity: 'same-package' }));
+  const result = planPlugins(records, [{ id: 'quota' }], { quota: true, '@scope/quota': false });
+  assert.equal(result.plugins.length, 1);
+  assert.equal(result.plugins[0].supported, true);
+  assert.equal(result.plugins[0].enabled, false);
+  assert.equal(result.plugins[0].conflict, true);
+  assert.deepEqual(result.plugins[0].aliases, ['quota', '@scope/quota']);
+  assert.deepEqual(result.patches, [{ id: 'quota', disabled: true }]);
+});
+
+test('Node engine ranges reject incompatible versions and unsupported syntax', () => {
+  assert(satisfiesNode('24.19.0', '>=22.12.0'));
+  assert(!satisfiesNode('20.1.0', '>=22.12.0'));
+  assert(satisfiesNode('24.19.0', '^22.0.0 || ^24.0.0'));
+  assert(!satisfiesNode('24.19.0', '~24.18.0'));
+  assert(satisfiesNode('24.19.0', '24.x'));
+  assert(!satisfiesNode('24.19.0', '<24'));
+  assert.throws(() => satisfiesNode('24.19.0', 'banana'));
+});
 
 const bundle = (name, roots, loaded = true) => ({
   name, version: '1.0.0', loaded, patches: [{ insert: roots }],
