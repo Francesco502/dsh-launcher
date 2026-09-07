@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dsh_update;
 mod lifecycle;
 mod log_relay;
 mod plugins;
@@ -436,13 +437,19 @@ struct AppState {
     status: Mutex<String>,
     sticky_status: AtomicBool,
     messages: Mutex<VecDeque<String>>,
-    operation_result: Mutex<Option<(Snapshot, Result<String, String>)>>,
+    operation_result: Mutex<Option<CompletedOperation>>,
     plugin_result: Mutex<Option<Result<plugins::Catalog, String>>>,
     plugin_window: AtomicUsize,
     busy: AtomicBool,
     cancelable: AtomicBool,
     refresh: Arc<SnapshotRefresh>,
     high_contrast: AtomicBool,
+}
+
+struct CompletedOperation {
+    snapshot: Snapshot,
+    result: Result<String, String>,
+    preserve_status: bool,
 }
 
 #[derive(Default)]
@@ -1177,6 +1184,19 @@ fn install_or_update(
     let npm = find_command("npm.cmd").ok_or_else(|| "未找到 npm；请先安装 Node.js。".to_owned())?;
     progress("正在查询 DSH 官方版本列表...", true);
     let latest = latest_dsh_version(&paths, &npm)?;
+    progress("正在核对 DSH 源码发布版本...", true);
+    let source = dsh_update::source_version(&paths);
+    if CANCEL.load(Ordering::Acquire) {
+        return Err("操作已取消".to_owned());
+    }
+    if let Err(error) = &source {
+        append_log(&paths.logs.join("launcher.log"), error);
+    }
+    let notice = dsh_update::source_notice(&latest, source.as_deref().map_err(String::as_str));
+    let with_notice = |message: String| match &notice {
+        Some(notice) => format!("{message}\n{notice}"),
+        None => message,
+    };
     let mut target_version = latest.clone();
     if let Some(current) = &current {
         let current_version = parse_version(&current.version)
@@ -1187,13 +1207,13 @@ fn install_or_update(
             if repair_requested {
                 target_version = current.version.clone();
             } else {
-                return Ok(format!(
-                    "当前 DSH {} 高于官方版本 {latest}，不降级",
+                return Ok(with_notice(format!(
+                    "当前 DSH {} 高于 npm 版本 {latest}，不降级",
                     current.version
-                ));
+                )));
             }
         } else if latest_version == current_version && !repair_requested {
-            return Ok(format!("DSH 已是最新版本 · {}", current.version));
+            return Ok(with_notice(format!("npm 已是最新 · {}", current.version)));
         }
     } else if let Some(repair) = &repair_version {
         if parse_version(repair).is_some_and(|value| {
@@ -1224,7 +1244,7 @@ fn install_or_update(
                 paths.npm_prefix.display()
             ),
         };
-        if !confirm(&description) {
+        if !confirm(&with_notice(description)) {
             return Err("操作已取消".to_owned());
         }
     }
@@ -1279,13 +1299,15 @@ fn install_or_update(
             .and_then(|installation| installation.ok_or_else(|| "提交后无法发现 DSH".to_owned()))
             .and_then(|promoted| start_installation(&paths, &promoted));
         match start_result {
-            Ok(_) => Ok(format!("DSH 已更新到 {target_version} 并重新启动")),
+            Ok(_) => Ok(with_notice(format!(
+                "DSH 已更新到 {target_version} 并重新启动"
+            ))),
             Err(error) => Err(format!(
                 "DSH 已更新到 {target_version}，但启动失败：{error}\n最新版本已保留。"
             )),
         }
     } else {
-        Ok(format!("DSH 已更新到 {target_version}"))
+        Ok(with_notice(format!("DSH 已更新到 {target_version}")))
     }
 }
 
@@ -1304,6 +1326,8 @@ fn latest_dsh_version(paths: &Paths, npm: &Path) -> Result<String, String> {
         manifest.package.as_str(),
         "versions",
         "--json",
+        "--prefer-online",
+        "--offline=false",
         "--registry",
         manifest.registry.as_str(),
         "--no-audit",
@@ -1320,6 +1344,9 @@ fn latest_dsh_version(paths: &Paths, npm: &Path) -> Result<String, String> {
 }
 
 fn parse_latest_version(text: &str) -> Option<String> {
+    if let Ok(version) = serde_json::from_str::<String>(text) {
+        return parse_version(&version).map(|_| version);
+    }
     let candidates: Vec<String> = serde_json::from_str::<Vec<String>>(text).unwrap_or_else(|_| {
         text.lines()
             .map(str::trim)
@@ -3025,11 +3052,11 @@ unsafe extern "system" fn window_proc(
                     .lock()
                     .ok()
                     .and_then(|mut result| result.take());
-                if let Some((snapshot, result)) = pending {
+                if let Some(completed) = pending {
                     if let Ok(mut current) = state.snapshot.lock() {
-                        *current = snapshot;
+                        *current = completed.snapshot;
                     }
-                    finish_operation(hwnd, &state, result);
+                    finish_operation(hwnd, &state, completed.result, completed.preserve_status);
                 }
             }
             0
@@ -3043,7 +3070,7 @@ unsafe extern "system" fn window_proc(
                     .and_then(|mut value| value.take());
                 match result {
                     Some(Ok(catalog)) => plugins::open(hwnd, state, catalog),
-                    Some(Err(error)) => finish_operation(hwnd, &state, Err(error)),
+                    Some(Err(error)) => finish_operation(hwnd, &state, Err(error), false),
                     None => {}
                 }
             }
@@ -3669,6 +3696,7 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
                     hwnd_value as HWND,
                     &state,
                     Err("已有启动器操作正在执行".to_owned()),
+                    false,
                 );
                 return;
             }
@@ -3702,22 +3730,49 @@ unsafe fn request_operation(hwnd: HWND, operation: Operation) {
                 install_or_update(false, &progress, Some(&confirm))
             }
         });
-        post_operation_result(hwnd_value as HWND, &state, result);
+        post_operation_result(
+            hwnd_value as HWND,
+            &state,
+            result,
+            matches!(operation, Operation::Upgrade | Operation::Install),
+        );
     });
 }
 
-fn post_operation_result(hwnd: HWND, state: &Arc<AppState>, result: Result<String, String>) {
+fn post_operation_result(
+    hwnd: HWND,
+    state: &Arc<AppState>,
+    result: Result<String, String>,
+    preserve_status: bool,
+) {
     let snapshot = refresh_discovery(&state.paths);
     if let Ok(mut pending) = state.operation_result.lock() {
-        *pending = Some((snapshot, result));
+        *pending = Some(CompletedOperation {
+            snapshot,
+            result,
+            preserve_status,
+        });
     }
     unsafe { PostMessageW(hwnd, OPERATION_MESSAGE, 0, 0) };
 }
 
-fn finish_operation(hwnd: HWND, state: &Arc<AppState>, result: Result<String, String>) {
-    state
-        .sticky_status
-        .store(result.is_err(), Ordering::Release);
+fn preserve_operation_status(result: &Result<String, String>, preserve_status: bool) -> bool {
+    match result {
+        Ok(_) => preserve_status,
+        Err(error) => error != "操作已取消",
+    }
+}
+
+fn finish_operation(
+    hwnd: HWND,
+    state: &Arc<AppState>,
+    result: Result<String, String>,
+    preserve_status: bool,
+) {
+    state.sticky_status.store(
+        preserve_operation_status(&result, preserve_status),
+        Ordering::Release,
+    );
     // Dialogs and controls belong to the window thread. Keep exit disabled
     // until the modal error dialog is dismissed and all UI work is complete.
     state.cancelable.store(false, Ordering::Release);
@@ -3782,8 +3837,9 @@ unsafe fn request_launcher_check(hwnd: HWND) {
                 hwnd_value as HWND,
                 &state,
                 Ok(format!("启动器已是最新版本 · v{APP_VERSION}")),
+                true,
             ),
-            Err(error) => post_operation_result(hwnd_value as HWND, &state, Err(error)),
+            Err(error) => post_operation_result(hwnd_value as HWND, &state, Err(error), true),
         }
     });
 }
@@ -4387,6 +4443,26 @@ mod tests {
     }
 
     #[test]
+    fn update_results_survive_health_refresh_but_cancellation_does_not_stick() {
+        assert!(preserve_operation_status(
+            &Ok("npm 已是最新".to_owned()),
+            true
+        ));
+        assert!(!preserve_operation_status(
+            &Ok("DSH 已停止".to_owned()),
+            false
+        ));
+        assert!(preserve_operation_status(
+            &Err("network failure".to_owned()),
+            false
+        ));
+        assert!(!preserve_operation_status(
+            &Err("操作已取消".to_owned()),
+            true
+        ));
+    }
+
+    #[test]
     fn restart_stops_before_starting_and_preserves_failure_stage() {
         use std::cell::RefCell;
         let calls = RefCell::new(Vec::new());
@@ -4467,6 +4543,14 @@ mod tests {
 
     #[test]
     fn all_registry_versions_include_alpha_four() {
+        assert_eq!(
+            parse_latest_version(r#"["0.1.3-alpha.1","0.1.2-rc.1"]"#),
+            Some("0.1.3-alpha.1".to_owned())
+        );
+        assert_eq!(
+            parse_latest_version(r#""0.1.3-alpha.1""#),
+            Some("0.1.3-alpha.1".to_owned())
+        );
         assert_eq!(
             parse_latest_version(r#"["0.1.1-rc.2","0.1.2-alpha.3","0.1.2-alpha.4"]"#),
             Some("0.1.2-alpha.4".to_owned())

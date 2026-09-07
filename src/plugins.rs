@@ -246,7 +246,7 @@ pub(super) unsafe fn open(owner: HWND, state: Arc<AppState>, catalog: Catalog) {
     );
     if window.is_null() {
         drop(Box::from_raw(data));
-        finish_operation(owner, &state, Err("无法打开插件选择窗口".to_owned()));
+        finish_operation(owner, &state, Err("无法打开插件选择窗口".to_owned()), false);
         return;
     }
     state
