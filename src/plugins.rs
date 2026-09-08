@@ -744,6 +744,22 @@ mod tests {
             assert!(after.0 <= before.0 + 2 * 1024 * 1024);
             assert!(after.1 <= middle.1 + 1);
             DestroyWindow(owner);
+            // A private Node fixture exercises ownership rediscovery without binding
+            // the user's DSH port or loading their profile.
+            state.paths.ensure_layout().unwrap();
+            let entry = root.join("node_modules/@deepseek-ai/dsh/lib/bin.js");
+            fs::create_dir_all(entry.parent().unwrap()).unwrap();
+            fs::write(&entry, b"setTimeout(() => {}, 60000);").unwrap();
+            let mut service = hidden_command(find_command("node.exe").unwrap())
+                .arg(&entry)
+                .args(["web", "--port", "3080"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            fs::write(state.paths.pid_file(), service.id().to_string()).unwrap();
+            assert_eq!(tracked_dsh_pid(&state.paths).unwrap(), Some(service.id()));
             // Exercise the actual main-window message handlers without network work.
             state.busy.store(true, Ordering::Release);
             state.cancelable.store(true, Ordering::Release);
@@ -780,6 +796,13 @@ mod tests {
             assert!(response < Duration::from_millis(100));
             SendMessageW(window, WM_CLOSE, 0, 0);
             assert_eq!(IsWindowVisible(window), 0);
+            assert!(service.try_wait().unwrap().is_none());
+            assert_ne!(
+                windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(window),
+                0
+            );
+            show_main_window(window);
+            assert_ne!(IsWindowVisible(window), 0);
             state.busy.store(false, Ordering::Release);
             CANCEL.store(false, Ordering::Release);
             SendMessageW(window, WM_COMMAND, CMD_EXIT as usize, 0);
@@ -787,8 +810,14 @@ mod tests {
                 windows_sys::Win32::UI::WindowsAndMessaging::IsWindow(window),
                 0
             );
+            assert!(service.try_wait().unwrap().is_none());
+            // WM_DESTROY released the observer; a fresh panel must rediscover it.
+            assert_eq!(tracked_dsh_pid(&state.paths).unwrap(), Some(service.id()));
+            lifecycle::set_window(std::ptr::null_mut());
+            service.kill().unwrap();
+            service.wait().unwrap();
             println!(
-                "mainFeedbackMicroseconds={} closeHides=true exitDestroys=true",
+                "mainFeedbackMicroseconds={} closeHides=true reopenShows=true exitDestroys=true serviceSurvives=true rediscovered=true",
                 response.as_micros()
             );
         }

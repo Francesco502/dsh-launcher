@@ -69,8 +69,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{
     IsUserAnAdmin, SetCurrentProcessExplicitAppUserModelID, ShellExecuteW, Shell_NotifyIconW,
-    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
@@ -2708,18 +2708,29 @@ fn acquire_action_mutex() -> Option<MutexGuard> {
     create_mutex(ACTION_MUTEX)
 }
 
-fn acquire_single_instance() -> Option<MutexGuard> {
-    let executable = env::current_exe().ok()?;
+fn instance_hash(executable: &Path) -> u64 {
     let normalized = executable.to_string_lossy().to_ascii_lowercase();
     let mut hash = 0xcbf29ce484222325u64;
     for byte in normalized.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let name = format!("Local\\DeepSeek.DSHLauncher.{hash:016x}");
+    hash
+}
+
+fn instance_window_class(executable: &Path) -> String {
+    format!("{WINDOW_CLASS}.{:016x}", instance_hash(executable))
+}
+
+fn acquire_single_instance() -> Option<MutexGuard> {
+    let executable = env::current_exe().ok()?;
+    let name = format!(
+        "Local\\DeepSeek.DSHLauncher.{:016x}",
+        instance_hash(&executable)
+    );
     let guard = create_mutex(&name);
     if guard.is_none() {
-        let class = to_wide(WINDOW_CLASS);
+        let class = to_wide(&instance_window_class(&executable));
         let existing = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
         if !existing.is_null() {
             unsafe { PostMessageW(existing, SHOW_MESSAGE, 0, 0) };
@@ -2806,7 +2817,8 @@ fn run_app() -> Result<(), String> {
 }
 
 unsafe fn create_main_window(hinstance: *mut c_void, state: Arc<AppState>) -> Result<(), String> {
-    let class_name = to_wide(WINDOW_CLASS);
+    let executable = env::current_exe().map_err(|error| error.to_string())?;
+    let class_name = to_wide(&instance_window_class(&executable));
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
         style: 0,
@@ -3605,7 +3617,7 @@ unsafe fn refresh_controls(hwnd: HWND, state: &AppState) {
     };
     state.tray_icon.store(icon, Ordering::Release);
     set_window_icon(hwnd, icon as HICON);
-    update_tray(hwnd, icon as HICON, &status);
+    update_tray(hwnd, icon as HICON, snapshot.running);
     for id in [
         CMD_MAIN,
         CMD_WEB,
@@ -4010,7 +4022,12 @@ unsafe fn show_tray_menu(hwnd: HWND, state: &AppState) {
 unsafe fn add_tray(hwnd: HWND, state: &AppState) -> i32 {
     let icon = state.tray_icon.load(Ordering::Acquire) as HICON;
     let mut data = notify_data(hwnd, icon);
-    copy_wide(&mut data.szTip, WINDOW_TITLE);
+    let running = state
+        .snapshot
+        .lock()
+        .map(|value| value.running)
+        .unwrap_or(false);
+    copy_wide(&mut data.szTip, tray_tooltip(running));
     let result = Shell_NotifyIconW(NIM_ADD, &data);
     if result != 0 {
         state.tray_added.store(true, Ordering::Release);
@@ -4022,10 +4039,18 @@ unsafe fn add_tray(hwnd: HWND, state: &AppState) -> i32 {
     result
 }
 
-unsafe fn update_tray(hwnd: HWND, icon: HICON, status: &str) {
+fn tray_tooltip(running: bool) -> &'static str {
+    if running {
+        "DSH服务运行中"
+    } else {
+        "DSH服务不在运行中"
+    }
+}
+
+unsafe fn update_tray(hwnd: HWND, icon: HICON, running: bool) {
     let mut data = notify_data(hwnd, icon);
-    data.uFlags = NIF_ICON | NIF_TIP;
-    copy_wide(&mut data.szTip, &format!("DSH启动器 · {status}"));
+    data.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    copy_wide(&mut data.szTip, tray_tooltip(running));
     Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 
@@ -4048,7 +4073,7 @@ fn notify_data(hwnd: HWND, icon: HICON) -> NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
         uID: 1,
-        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
         uCallbackMessage: TRAY_MESSAGE,
         hIcon: icon,
         ..NOTIFYICONDATAW::default()
@@ -4244,6 +4269,16 @@ fn first_line(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reopen_window_identity_matches_the_installation_mutex() {
+        let first = Path::new(r"D:\Apps\DSH\DSH-Launcher.exe");
+        let same = Path::new(r"d:\apps\dsh\dsh-launcher.exe");
+        let other = Path::new(r"D:\Test\DSH\DSH-Launcher.exe");
+        assert_eq!(instance_window_class(first), instance_window_class(same));
+        assert_ne!(instance_window_class(first), instance_window_class(other));
+        assert!(instance_window_class(first).ends_with(&format!("{:016x}", instance_hash(first))));
+    }
 
     fn test_paths(base: &Path) -> Paths {
         Paths {
