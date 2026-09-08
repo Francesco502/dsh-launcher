@@ -3,6 +3,7 @@
 mod dsh_update;
 mod lifecycle;
 mod log_relay;
+mod native_deps;
 mod plugins;
 mod self_update;
 
@@ -879,6 +880,7 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
     if tcp_open(DSH_PORT) {
         return Err("3080 端口已被其他程序占用；未启动 DSH。".to_owned());
     }
+    native_deps::check(paths, installation)?;
     let browser_entry = paths.state.join("browser-entry.cjs");
     if fs::read(&browser_entry).ok().as_deref() != Some(BROWSER_ENTRY) {
         atomic_write(&browser_entry, BROWSER_ENTRY)?;
@@ -1020,7 +1022,22 @@ fn startup_failure(
     let plugin_failure = detail.contains("plugin tree failed to load")
         || detail.contains("failed to import loader entry")
         || detail.contains("failed to apply loader entry");
-    let message = if plugin_failure {
+    let native_failure = detail.contains("ERR_DLOPEN_FAILED")
+        || (detail.contains(".node")
+            && (detail.contains("Cannot find module")
+                || detail.contains("not a valid Win32 application")
+                || detail.contains("specified module could not be found")));
+    let message = if !installation.entry.is_file() && !plugin_failure {
+        mark_repair_needed(paths, installation);
+        "DSH 安装入口缺失，请重新安装 DSH".to_owned()
+    } else if detail.contains("NODE_MODULE_VERSION") || detail.contains("different Node.js version")
+    {
+        "DSH 原生依赖与当前 Node ABI 不兼容；请使用匹配的 Node，或点击“更新 DSH”重新构建依赖。关闭可选插件无效。".to_owned()
+    } else if native_failure {
+        "DSH 原生依赖缺失或无法加载；请点击“更新 DSH”修复依赖，即使版本相同也会修复。关闭可选插件无效。".to_owned()
+    } else if detail.contains("EADDRINUSE") {
+        "3080 端口冲突，请释放端口后重试".to_owned()
+    } else if plugin_failure {
         let mut plugins = Vec::new();
         for line in detail.lines() {
             if !line.contains("failed to import loader entry")
@@ -1047,17 +1064,33 @@ fn startup_failure(
                 plugins.push(name);
             }
         }
+        let metadata = installation
+            .entry
+            .parent()
+            .and_then(Path::parent)
+            .and_then(|package| fs::read(package.join("package.json")).ok())
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let builtin = !plugins.is_empty()
+            && plugins.iter().all(|name| {
+                *name == "@deepseek-ai/dsh-session-persistence-jsonl"
+                    || metadata
+                        .as_ref()
+                        .is_some_and(|value| value["dependencies"].get(*name).is_some())
+            });
         let packages = if plugins.is_empty() {
             String::new()
         } else {
-            format!("\n涉及插件：{}", plugins.join("、"))
+            format!(
+                "\n涉及{}：{}",
+                if builtin { "内置组件" } else { "插件" },
+                plugins.join("、")
+            )
         };
-        format!("DSH 插件加载失败；请检查插件与 DSH {} 的兼容性，更新或停用出错插件后重试。重新安装 DSH 不会修复插件。{packages}", installation.version)
-    } else if !installation.entry.is_file() {
-        mark_repair_needed(paths, installation);
-        "DSH 安装入口缺失，请重新安装 DSH".to_owned()
-    } else if detail.contains("EADDRINUSE") {
-        "3080 端口冲突，请释放端口后重试".to_owned()
+        if builtin {
+            format!("DSH {} 内置组件加载失败；不是可选插件开关问题。请检查 DSH 安装依赖和本次日志。{packages}", installation.version)
+        } else {
+            format!("DSH 插件加载失败；请检查插件与 DSH {} 的兼容性，更新或停用出错插件后重试。重新安装 DSH 不会修复插件。{packages}", installation.version)
+        }
     } else if detail.contains("SyntaxError")
         || detail.contains("YAML")
         || detail.contains("configuration")
@@ -1176,8 +1209,13 @@ fn install_or_update(
         Err(error) => return Err(error),
     };
     let repair_version = read_repair_version(&paths);
-    let repair_requested =
-        paths.repair_file().is_file() || (paths.managed_package().exists() && current.is_none());
+    let repair_requested = paths.repair_file().is_file()
+        || (paths.managed_package().exists() && current.is_none())
+        || current
+            .as_ref()
+            .map(|installation| native_deps::needs_repair(&paths, installation))
+            .transpose()?
+            .unwrap_or(false);
     if current.is_none() && !allow_install && !repair_requested {
         return Err("未找到 DSH；请先使用“安装 DSH”。".to_owned());
     }
@@ -1265,7 +1303,12 @@ fn install_or_update(
         version: target_version.clone(),
         profile: target_profile,
     };
-    progress("正在预检 Node、配置和插件入口...", true);
+    progress("正在检查并构建候选原生依赖...", true);
+    if let Err(error) = native_deps::prepare(&paths, &npm, &stage, &staged_installation) {
+        let _ = safe_remove_dir(&paths, &stage);
+        return Err(error);
+    }
+    progress("正在预检 Node、原生依赖、配置和插件入口...", true);
     if let Err(error) = plugins::preflight(&paths, &staged_installation) {
         let _ = safe_remove_dir(&paths, &stage);
         return Err(error);
@@ -4041,9 +4084,9 @@ unsafe fn add_tray(hwnd: HWND, state: &AppState) -> i32 {
 
 fn tray_tooltip(running: bool) -> &'static str {
     if running {
-        "DSH服务运行中"
+        "DSH运行中"
     } else {
-        "DSH服务不在运行中"
+        "DSH未启动"
     }
 }
 
@@ -4305,6 +4348,32 @@ mod tests {
             .to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn startup_native_and_builtin_errors_are_not_optional_plugin_advice() {
+        let base = env::temp_dir().join(format!("dsh-native-diagnostics-{}", transaction_nonce()));
+        let paths = test_paths(&base);
+        paths.ensure_layout().unwrap();
+        let mut installation = snapshot(true, true, true, false).installation.unwrap();
+        installation.entry = base.join("lib/bin.js");
+        fs::create_dir_all(installation.entry.parent().unwrap()).unwrap();
+        fs::write(&installation.entry, "").unwrap();
+        let log = paths.logs.join("dsh.err.log");
+        for (detail, expected) in [
+            ("plugin tree failed to load: Cannot find module './build/Release/fs_ext.node'", "原生依赖缺失"),
+            ("failed to import loader entry persistence: NODE_MODULE_VERSION 127 != 137", "Node ABI 不兼容"),
+            ("failed to import loader entry persistence (@deepseek-ai/dsh-session-persistence-jsonl): missing export", "内置组件加载失败"),
+            ("failed to apply loader entry server: EADDRINUSE", "端口冲突"),
+        ] {
+            fs::write(&log, detail).unwrap();
+            let error = startup_failure(&paths, &installation, None, "启动失败");
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("停用出错插件"));
+            assert!(!error.contains("重新安装 DSH 不会修复"));
+            assert!(!paths.repair_file().exists());
+        }
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

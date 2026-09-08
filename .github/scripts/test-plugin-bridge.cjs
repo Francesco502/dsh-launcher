@@ -2,6 +2,43 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { planPlugins } = require('../../src/plugin_bridge.cjs');
 const { satisfiesNode } = require('../../src/plugin_bridge.cjs');
+const { nativeDependencies, assertNativeDependencies } = require('../../src/plugin_bridge.cjs');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+test('native checks load the addon, reject missing binaries and ABI drift, without initializing plugins', t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-native-check-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const [kind, source] of Object.entries({
+    native: "throw new Error(\"Cannot find module './build/Release/fs_ext.node'\");",
+    node: "throw new Error('NODE_MODULE_VERSION 127; current version 137');",
+    ready: "exports.flock = () => {};",
+  })) {
+    const modules = path.join(root, kind, 'node_modules');
+    const write = (name, metadata, code) => {
+      const directory = path.join(modules, name);
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, 'package.json'), JSON.stringify({name, version: '2.1.1', main: 'index.js', ...metadata}));
+      fs.writeFileSync(path.join(directory, 'index.js'), code);
+      return directory;
+    };
+    // DSH ships this transitively through its base bundle; its own manifest
+    // lists it in devDependencies, not necessarily dependencies.
+    const dsh = write('@deepseek-ai/dsh', {devDependencies: {'@deepseek-ai/dsh-session-persistence-jsonl': '*'}}, '');
+    fs.mkdirSync(path.join(dsh, 'lib'));
+    write('@deepseek-ai/dsh-session-persistence-jsonl', {dependencies: {'fs-ext': '*'}}, "throw new Error('Plugin must not initialize during native probe');");
+    write('fs-ext', {}, source);
+    const result = nativeDependencies(path.join(dsh, 'lib/bin.js'));
+    assert.equal(result.length, 1);
+    assert.equal(result[0].loaded, kind === 'ready');
+    if (kind === 'ready') assert.doesNotThrow(() => assertNativeDependencies(result));
+    else {
+      assert.equal(result[0].kind, kind);
+      assert.throws(() => assertNativeDependencies(result), /内置原生依赖无法加载：fs-ext/);
+    }
+  }
+});
 
 test('aliases of one actual bundle share a toggle; conflicting saved aliases fail closed', () => {
   const records = ['quota', '@scope/quota'].map(name => ({ ...bundle(name, [{ id: 'quota' }]), identity: 'same-package' }));

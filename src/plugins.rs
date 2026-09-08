@@ -77,13 +77,13 @@ fn inspect_settings(
     installation: &Installation,
     settings: &Path,
 ) -> Result<serde_json::Value, String> {
-    inspect_mode(paths, installation, settings, false)
+    inspect_mode(paths, installation, settings, "")
 }
 fn inspect_mode(
     paths: &Paths,
     installation: &Installation,
     settings: &Path,
-    preflight: bool,
+    mode: &str,
 ) -> Result<serde_json::Value, String> {
     let bridge = paths.state.join("plugin-bridge.cjs");
     if fs::read(&bridge).ok().as_deref() != Some(BRIDGE) {
@@ -97,16 +97,30 @@ fn inspect_mode(
     } else {
         command.arg("");
     }
-    if preflight {
-        command.arg("preflight");
-    }
+    command.arg(mode);
     command.env("TEMP", &paths.temp).env("TMP", &paths.temp);
-    let output = run_capture(paths, &mut command, "读取插件配置", QUERY_TIMEOUT, true)?;
+    let label = match mode {
+        "native" => "检查 DSH 原生依赖",
+        "preflight" => "预检 DSH 配置和依赖",
+        _ => "读取插件配置",
+    };
+    let output = run_capture(paths, &mut command, label, QUERY_TIMEOUT, true)?;
     serde_json::from_str(&output).map_err(|error| format!("插件列表格式无效：{error}"))
 }
 
 pub(super) fn preflight(paths: &Paths, installation: &Installation) -> Result<(), String> {
-    inspect_mode(paths, installation, &settings_path(paths), true).map(|_| ())
+    inspect_mode(paths, installation, &settings_path(paths), "preflight").map(|_| ())
+}
+
+pub(super) fn native_dependencies(
+    paths: &Paths,
+    installation: &Installation,
+) -> Result<Vec<serde_json::Value>, String> {
+    let value = inspect_mode(paths, installation, &settings_path(paths), "native")?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| "原生依赖检查结果无效".to_owned())
 }
 
 pub(super) fn startup_patch(

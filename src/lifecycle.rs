@@ -219,14 +219,22 @@ mod tests {
             let mut tree = ProcessTree::capture(child.id()).unwrap();
             let start = Instant::now();
             assert_eq!(graceful_stop(child.id()).unwrap(), Some(mode == "exit"));
+            let elapsed = start.elapsed();
             if mode == "ignore" {
-                assert!(start.elapsed() >= STOP_TIMEOUT);
                 tree.terminate().unwrap();
             }
             child.wait().unwrap();
             assert!(tree.finished().unwrap());
-            println!("stopMode={mode} elapsedMs={}", start.elapsed().as_millis());
+            println!("stopMode={mode} elapsedMs={}", elapsed.as_millis());
             fs::remove_dir_all(directory).unwrap();
+            if mode == "ignore" {
+                // Windows wait timeouts use the system clock rather than Instant's
+                // high-resolution counter; allow one ordinary scheduler tick.
+                assert!(
+                    elapsed + Duration::from_millis(20) >= STOP_TIMEOUT,
+                    "timeout returned after {elapsed:?}"
+                );
+            }
         }
     }
 }

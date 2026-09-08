@@ -88,6 +88,14 @@ async function inspect(entry, settingsFile, portableHome, preflight = false) {
       const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
       if (pkg.engines?.node && !satisfiesNode(process.versions.node, pkg.engines.node)) throw new Error(`Node ${process.versions.node} 不满足 ${name} 要求 ${pkg.engines.node}`);
     }
+    assertNativeDependencies(nativeDependencies(entry));
+    const backend = '@deepseek-ai/dsh-session-persistence-jsonl';
+    let backendEntry;
+    try { backendEntry = resolve.resolve(backend); } catch {}
+    if (backendEntry) {
+      try { await import(pathToFileURL(backendEntry).href); }
+      catch (error) { throw new Error(`DSH 内置组件无法加载：${backend}；${error.code || '模块兼容性错误'}。候选不能提交。`); }
+    }
   }
   const profileDir = portableHome ? path.join(portableHome, 'profiles', 'web') : core.resolveProfileDir('web');
   const key = portableHome ? 'portable:web' : `user:${path.resolve(profileDir).toLowerCase()}`;
@@ -136,6 +144,45 @@ async function inspect(entry, settingsFile, portableHome, preflight = false) {
   return { key, ...result };
 }
 
+// Only inspect the shipped persistence backend's native dependencies. Never
+// import user plugins or call a persistence service during an update preflight.
+function nativeDependencies(entry) {
+  const metadata = JSON.parse(fs.readFileSync(path.resolve(path.dirname(entry), '..', 'package.json'), 'utf8'));
+  const backend = '@deepseek-ai/dsh-session-persistence-jsonl';
+  let backendFile;
+  try { backendFile = packageFile(createRequire(entry), backend); }
+  catch (error) {
+    if (error.code === 'MODULE_NOT_FOUND' && !metadata.dependencies?.[backend] && !metadata.devDependencies?.[backend]) return [];
+    throw new Error(`DSH 内置组件缺失：${backend}；请修复 DSH 安装依赖。`);
+  }
+  const root = fs.realpathSync(path.resolve(path.dirname(entry), '../../..')).toLowerCase() + path.sep;
+  const localFile = file => {
+    if (!fs.realpathSync(file).toLowerCase().startsWith(root)) throw new Error('原生依赖解析到了 DSH 安装目录外');
+    return file;
+  };
+  localFile(backendFile);
+  const pkg = JSON.parse(fs.readFileSync(backendFile, 'utf8'));
+  const resolver = createRequire(backendFile);
+  return ['fs-ext', 'koffi'].filter(name => pkg.dependencies?.[name]).map(name => {
+    const file = localFile(packageFile(resolver, name));
+    const { version } = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!/^\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/.test(version)) throw new Error(`原生依赖版本无效：${name}`);
+    try {
+      const module = resolver(name);
+      if (typeof module[name === 'fs-ext' ? 'flock' : 'load'] !== 'function') throw new Error('native API missing');
+      return { name, version, loaded: true };
+    } catch (error) {
+      return { name, version, loaded: false,
+        kind: /NODE_MODULE_VERSION|different Node\.js version/.test(error.message) ? 'node' : 'native' };
+    }
+  });
+}
+
+function assertNativeDependencies(modules) {
+  const failed = modules.filter(module => !module.loaded);
+  if (failed.length) throw new Error(`DSH 内置原生依赖无法加载：${failed.map(module => module.name).join('、')}；候选不能提交，请修复依赖构建或 Node 版本。`);
+}
+
 function packageFile(resolve, name) {
   try { return resolve.resolve(`${name}/package.json`); } catch {}
   let dir = path.dirname(resolve.resolve(name));
@@ -172,9 +219,11 @@ function satisfiesNode(version, range) {
   });
 }
 
-module.exports = { planPlugins, inspect, satisfiesNode };
+module.exports = { planPlugins, inspect, satisfiesNode, nativeDependencies, assertNativeDependencies };
 if (require.main === module) {
-  inspect(process.argv[2], process.argv[3], process.argv[4] || undefined, process.argv[5] === 'preflight').then(result => {
+  Promise.resolve().then(() => process.argv[5] === 'native'
+    ? nativeDependencies(process.argv[2])
+    : inspect(process.argv[2], process.argv[3], process.argv[4] || undefined, process.argv[5] === 'preflight')).then(result => {
     process.stdout.write(JSON.stringify(result));
   }).catch(error => {
     process.stderr.write(error.message);
