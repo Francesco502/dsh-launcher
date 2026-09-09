@@ -1,3 +1,4 @@
+#requires -Version 7.0
 param([Parameter(Mandatory)][string]$AppDirectory,[Parameter(Mandatory)][string]$Candidate)
 $ErrorActionPreference='Stop'
 $root=(Resolve-Path -LiteralPath $AppDirectory).Path
@@ -26,11 +27,16 @@ if ($candidateVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Candidate must have 
 $record=@{phase='prepared';version=$candidateVersion;token=[Guid]::NewGuid().ToString('N');parent_pid=$parent.Id;parent_created=$parent.StartTime.ToUniversalTime().ToFileTimeUtc();helper_pid=0;helper_created=0}
 $recordFile=Join-Path $stage 'transaction.json'
 [IO.File]::WriteAllText($recordFile,($record | ConvertTo-Json -Compress))
-$helper=Start-Process -FilePath (Join-Path $stage 'helper.exe') -ArgumentList @('--self-update-apply',('"'+$root+'"'),$record.token) -WindowStyle Hidden -PassThru
+$helper=Start-Process -FilePath (Join-Path $stage 'helper.exe') -ArgumentList @('--self-update-apply',('"'+$root+'"'),$record.token) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $stage 'helper.stderr')
 $record.helper_pid=$helper.Id; $record.helper_created=$helper.StartTime.ToUniversalTime().ToFileTimeUtc()
-$temporary=$recordFile+'.tmp'; [IO.File]::WriteAllText($temporary,($record | ConvertTo-Json -Compress)); Move-Item -LiteralPath $temporary -Destination $recordFile -Force
+$temporary=$recordFile+'.tmp'; [IO.File]::WriteAllText($temporary,($record | ConvertTo-Json -Compress)); [IO.File]::Move($temporary, $recordFile, $true)
 $deadline=[DateTime]::UtcNow.AddSeconds(15)
-while(!(Test-Path -LiteralPath (Join-Path $stage 'helper-ready'))) { if([DateTime]::UtcNow -gt $deadline) { throw 'Helper not ready' }; Start-Sleep -Milliseconds 50 }
+while(!(Test-Path -LiteralPath (Join-Path $stage 'helper-ready'))) {
+    $helper.Refresh()
+    if ($helper.HasExited) { throw "Update helper exited ($($helper.ExitCode)): $(Get-Content -LiteralPath (Join-Path $stage 'helper.stderr') -Raw)" }
+    if([DateTime]::UtcNow -gt $deadline) { throw 'Helper not ready' }
+    Start-Sleep -Milliseconds 50
+}
 Stop-Process -Id $parent.Id -Force
 $deadline=[DateTime]::UtcNow.AddSeconds(40)
 do { Start-Sleep -Milliseconds 50; $phase=(Get-Content -Raw -LiteralPath $recordFile | ConvertFrom-Json).phase; if([DateTime]::UtcNow -gt $deadline) { throw 'Update did not complete' } } while($phase -notin @('done','restored'))

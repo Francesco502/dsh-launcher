@@ -1,3 +1,4 @@
+#requires -Version 7.0
 param([Parameter(Mandatory)][string]$LauncherPath, [Parameter(Mandatory)][string]$WorkDirectory,
       [Parameter(Mandatory)][string]$OldLauncherPath, [string]$ParentLauncherPath)
 $ErrorActionPreference = 'Stop'
@@ -60,11 +61,16 @@ foreach ($case in @('success','candidate-fails','file-locked','interrupted')) {
             $record.parent_pid=$parent.Id; $record.parent_created=$parent.StartTime.ToUniversalTime().ToFileTimeUtc()
             Copy-Item -LiteralPath $parentSource -Destination (Join-Path $stage 'helper.exe') -Force
             [IO.File]::WriteAllText($recordFile, ($record | ConvertTo-Json -Compress))
-            $helper = Start-Process -FilePath (Join-Path $stage 'helper.exe') -ArgumentList @('--self-update-apply', ('"'+$root+'"'), $record.token) -WindowStyle Hidden -PassThru
+            $helper = Start-Process -FilePath (Join-Path $stage 'helper.exe') -ArgumentList @('--self-update-apply', ('"'+$root+'"'), $record.token) -WindowStyle Hidden -PassThru -RedirectStandardError (Join-Path $stage 'helper.stderr')
             $record.helper_pid=$helper.Id; $record.helper_created=$helper.StartTime.ToUniversalTime().ToFileTimeUtc()
             # Atomic record replacement, matching the production parent/helper handshake.
-            $recordTemp=$recordFile+'.tmp'; [IO.File]::WriteAllText($recordTemp, ($record | ConvertTo-Json -Compress)); Move-Item -LiteralPath $recordTemp -Destination $recordFile -Force
-            Wait-For { Test-Path -LiteralPath (Join-Path $stage 'helper-ready') }
+            $recordTemp=$recordFile+'.tmp'; [IO.File]::WriteAllText($recordTemp, ($record | ConvertTo-Json -Compress)); [IO.File]::Move($recordTemp, $recordFile, $true)
+            Wait-For {
+                if (Test-Path -LiteralPath (Join-Path $stage 'helper-ready')) { return $true }
+                $helper.Refresh()
+                if ($helper.HasExited) { throw "Update helper exited ($($helper.ExitCode)): $(Get-Content -LiteralPath (Join-Path $stage 'helper.stderr') -Raw)" }
+                return $false
+            }
             if ($case -eq 'file-locked') { $lock=[IO.File]::Open((Join-Path $root 'dshctl.cmd'),'Open','Read','Read') }
             Stop-Process -Id $parent.Id -Force
         }
