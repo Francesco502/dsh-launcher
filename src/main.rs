@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod dialogs;
 mod dsh_update;
 mod lifecycle;
 mod log_relay;
@@ -3052,7 +3053,7 @@ unsafe extern "system" fn window_proc(
             let item = lparam as *const DRAWITEMSTRUCT;
             if !item.is_null() {
                 if let Some(state) = state_for(hwnd) {
-                    draw_button(&state, &*item);
+                    draw_button(state.high_contrast.load(Ordering::Acquire), &*item);
                     return 1;
                 }
             }
@@ -3513,12 +3514,17 @@ fn desired_client_size(dpi: u32) -> (i32, i32) {
     (scale(CLIENT_WIDTH, dpi), scale(CLIENT_HEIGHT, dpi))
 }
 
-unsafe fn draw_button(state: &AppState, item: &DRAWITEMSTRUCT) {
+unsafe fn draw_button(high_contrast: bool, item: &DRAWITEMSTRUCT) {
+    // WM_DRAWITEM lends us the control's DC. Restore its objects and colors
+    // before returning; later native control painting can reuse this DC.
+    let saved_dc = windows_sys::Win32::Graphics::Gdi::SaveDC(item.hDC);
+    if saved_dc == 0 {
+        return;
+    }
     let disabled = item.itemState & ODS_DISABLED != 0;
     let selected = item.itemState & ODS_SELECTED != 0;
     let footer = item.CtlID == CMD_CHECK_LAUNCHER;
     let primary = item.CtlID == CMD_MAIN;
-    let high_contrast = state.high_contrast.load(Ordering::Acquire);
     let fill = if high_contrast {
         GetSysColor(COLOR_BTNFACE)
     } else if footer {
@@ -3568,7 +3574,6 @@ unsafe fn draw_button(state: &AppState, item: &DRAWITEMSTRUCT) {
             12,
         );
     }
-    DeleteObject(brush);
     let mut text = [0u16; 128];
     let length = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
         item.hwndItem,
@@ -3593,6 +3598,8 @@ unsafe fn draw_button(state: &AppState, item: &DRAWITEMSTRUCT) {
         focus.bottom -= 4;
         DrawFocusRect(item.hDC, &focus);
     }
+    windows_sys::Win32::Graphics::Gdi::RestoreDC(item.hDC, saved_dc);
+    DeleteObject(brush);
 }
 
 unsafe fn refresh_controls(hwnd: HWND, state: &AppState) {
@@ -4194,7 +4201,7 @@ unsafe fn set_text(hwnd: HWND, text: &str) {
 unsafe fn confirm_box(hwnd: HWND, text: &str) -> bool {
     let text = to_wide(text);
     let title = to_wide(WINDOW_TITLE);
-    MessageBoxW(
+    dialogs::message_box(
         hwnd,
         text.as_ptr(),
         title.as_ptr(),
@@ -4205,7 +4212,7 @@ unsafe fn confirm_box(hwnd: HWND, text: &str) -> bool {
 unsafe fn show_info_box(hwnd: HWND, text: &str) {
     let text = to_wide(text);
     let title = to_wide(WINDOW_TITLE);
-    MessageBoxW(
+    dialogs::message_box(
         hwnd,
         text.as_ptr(),
         title.as_ptr(),
@@ -4216,7 +4223,7 @@ unsafe fn show_info_box(hwnd: HWND, text: &str) {
 fn show_error_box(hwnd: HWND, text: &str) {
     let text = to_wide(text);
     let title = to_wide(WINDOW_TITLE);
-    unsafe { MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR) };
+    unsafe { dialogs::message_box(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR) };
 }
 
 fn attach_console() {

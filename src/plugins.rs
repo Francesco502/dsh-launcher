@@ -225,6 +225,8 @@ pub(super) unsafe fn open(owner: HWND, state: Arc<AppState>, catalog: Catalog) {
         lpfnWndProc: Some(dialog_proc),
         hInstance: module,
         hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+        hIcon: state.tray_icon.load(Ordering::Acquire) as HICON,
+        hIconSm: state.tray_icon.load(Ordering::Acquire) as HICON,
         hbrBackground: (COLOR_BTNFACE + 1) as *mut c_void,
         lpszClassName: class_name.as_ptr(),
         ..WNDCLASSEXW::default()
@@ -266,8 +268,10 @@ pub(super) unsafe fn open(owner: HWND, state: Arc<AppState>, catalog: Catalog) {
     state
         .plugin_window
         .store(window as usize, Ordering::Release);
+    set_window_icon(window, state.tray_icon.load(Ordering::Acquire) as HICON);
     EnableWindow(owner, 0);
     ShowWindow(window, SW_SHOW);
+    dialogs::paint_now(window);
     SetFocus(GetDlgItem(window, LIST as i32));
 }
 
@@ -715,6 +719,23 @@ mod tests {
                 open(owner, Arc::clone(&state), catalog);
                 let dialog = state.plugin_window.load(Ordering::Acquire) as HWND;
                 assert!(!dialog.is_null());
+                assert_eq!(
+                    windows_sys::Win32::Graphics::Gdi::GetUpdateRect(
+                        dialog,
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    0,
+                    "dialog must be painted before open returns"
+                );
+                assert_eq!(
+                    windows_sys::Win32::Graphics::Gdi::GetUpdateRect(
+                        GetDlgItem(dialog, LIST as i32),
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    0
+                );
                 let mut title = [0u16; 64];
                 let length = windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
                     dialog,
@@ -725,8 +746,18 @@ mod tests {
                     String::from_utf16_lossy(&title[..length as usize]),
                     "选择插件"
                 );
-                DestroyWindow(dialog);
+                // Exercise the real dialog keyboard/message path, not only
+                // CreateWindow/DestroyWindow: Escape must close and re-enable
+                // the owner without leaving a pending paint or busy state.
+                let message = MSG {
+                    hwnd: dialog,
+                    message: WM_KEYDOWN,
+                    wParam: VK_ESCAPE as usize,
+                    ..MSG::default()
+                };
+                assert_ne!(IsDialogMessageW(dialog, &message), 0);
                 assert_eq!(state.plugin_window.load(Ordering::Acquire), 0);
+                assert_ne!(IsWindowEnabled(owner), 0);
                 assert_eq!(Arc::strong_count(&state), 1);
                 let mut message = MSG::default();
                 while windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW(

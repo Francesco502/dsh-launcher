@@ -73,6 +73,12 @@ jobs:
       - name: Test MSVC target
         run: cargo test --locked --target x86_64-pc-windows-msvc
 
+      - name: Test native dialog painting and lifetime
+        shell: pwsh
+        run: |
+          & .github\scripts\test-dialogs.ps1 -Target x86_64-pc-windows-gnu
+          & .github\scripts\test-dialogs.ps1 -Target x86_64-pc-windows-msvc
+
       - name: Build MSVC release
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bins
 
