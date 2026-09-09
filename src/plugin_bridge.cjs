@@ -75,7 +75,7 @@ function planPlugins(records, entries, overrides, compose) {
   return { plugins, patches, error };
 }
 
-async function inspect(entry, settingsFile, portableHome, preflight = false) {
+async function inspect(entry, settingsFile, portableHome, preflight = false, diagnostic = false, profileOverride, profileOnly = false) {
   const resolve = createRequire(entry);
   const core = await import(pathToFileURL(resolve.resolve('@deepseek-ai/dsh-app-boot')).href);
   for (const name of ['resolveProfileDir', 'resolveBundleDir', 'loadOverlayPatches', 'composeEntries', 'boot']) {
@@ -97,8 +97,19 @@ async function inspect(entry, settingsFile, portableHome, preflight = false) {
       catch (error) { throw new Error(`DSH 内置组件无法加载：${backend}；${error.code || '模块兼容性错误'}。候选不能提交。`); }
     }
   }
-  const profileDir = portableHome ? path.join(portableHome, 'profiles', 'web') : core.resolveProfileDir('web');
-  const key = portableHome ? 'portable:web' : `user:${path.resolve(profileDir).toLowerCase()}`;
+  const originalProfileDir = portableHome ? path.join(portableHome, 'profiles', 'web') : core.resolveProfileDir('web');
+  const profileDir = profileOverride || originalProfileDir;
+  const key = portableHome ? 'portable:web' : `user:${path.resolve(originalProfileDir).toLowerCase()}`;
+  if (profileOnly) return {profileDir};
+  const journal = path.join(path.dirname(profileDir), '.dsh-launcher-repair-' + path.basename(profileDir), 'transaction.json');
+  if (!profileOverride && fs.existsSync(journal)) {
+    const transaction = JSON.parse(fs.readFileSync(journal, 'utf8'));
+    if (transaction.phase !== 'done') {
+      const error = '插件修复尚未完成；请使用“修复依赖”恢复事务后重试。';
+      if (!diagnostic) throw new Error(error);
+      return {key, profileDir, plugins: [], issues: [], complete: false, error};
+    }
+  }
   let settings = { profiles: {} };
   if (fs.existsSync(settingsFile)) settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
   if (!settings.profiles || typeof settings.profiles !== 'object' || Array.isArray(settings.profiles)) throw new Error('插件设置文件格式无效');
@@ -111,11 +122,13 @@ async function inspect(entry, settingsFile, portableHome, preflight = false) {
   const anchor = path.resolve(path.dirname(entry), '..', 'package.json');
   const records = [];
   const layers = [];
+  const issues = [];
   for (const name of new Set([...bundles, ...Object.keys(manifest.dependencies || {})])) {
     const loaded = bundles.includes(name);
+    try {
     let dir;
     try { dir = core.resolveBundleDir('dsh', name, anchor, profileDir); }
-    catch (error) { if (loaded) throw error; else continue; }
+    catch (error) { if (loaded || diagnostic) throw error; else continue; }
     const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'));
     const patchFile = pkg.dsh?.bundle?.patch;
     if (typeof patchFile !== 'string') continue;
@@ -123,6 +136,10 @@ async function inspect(entry, settingsFile, portableHome, preflight = false) {
     if (loaded) layers.push(patches);
     if (Object.hasOwn(manifest.dependencies || {}, name)) records.push({ name, version: pkg.version, patches, loaded,
       directory: fs.realpathSync(dir), identity: `${pkg.name}@${pkg.version}:${JSON.stringify(patches)}` });
+    } catch (error) {
+      if (!diagnostic) throw error;
+      issues.push({ name, source: manifestFile, specification: manifest.dependencies?.[name] || '', reason: error.message });
+    }
   }
   const userPatch = path.join(profileDir, 'cordis.patch.yml');
   if (fs.existsSync(userPatch)) layers.push(core.loadOverlayPatches('dsh', userPatch));
@@ -141,7 +158,9 @@ async function inspect(entry, settingsFile, portableHome, preflight = false) {
       }
     }
   }
-  return { key, ...result };
+  return { key, ...result, profileDir, issues, complete: issues.length === 0,
+    plugins: [...result.plugins, ...issues.map(issue => ({ name: issue.name, aliases: [issue.name], version: '无法读取',
+      enabled: bundles.includes(issue.name), supported: false, conflict: false, reason: issue.reason }))] };
 }
 
 // Only inspect the shipped persistence backend's native dependencies. Never
@@ -223,7 +242,7 @@ module.exports = { planPlugins, inspect, satisfiesNode, nativeDependencies, asse
 if (require.main === module) {
   Promise.resolve().then(() => process.argv[5] === 'native'
     ? nativeDependencies(process.argv[2])
-    : inspect(process.argv[2], process.argv[3], process.argv[4] || undefined, process.argv[5] === 'preflight')).then(result => {
+    : inspect(process.argv[2], process.argv[3], process.argv[4] || undefined, process.argv[5] === 'preflight', process.argv[5] === 'catalog', process.argv[6] || undefined, process.argv[5] === 'profile')).then(result => {
     process.stdout.write(JSON.stringify(result));
   }).catch(error => {
     process.stderr.write(error.message);

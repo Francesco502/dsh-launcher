@@ -9,7 +9,7 @@ $binary = @($build | ForEach-Object { $_ | ConvertFrom-Json } | Where-Object {
 if ($binary.Count -ne 1) { throw 'Expected exactly one launcher test executable.' }
 $output = Join-Path $repo ".tmp-dialog-tests\$Target"
 [IO.Directory]::CreateDirectory($output) | Out-Null
-foreach ($test in @('native_message_boxes_paint_and_keep_owner_icon','real_dialog_lifetime_stress')) {
+foreach ($test in @('slint_window_lifetime_and_opaque_states')) {
     $stdout = Join-Path $output "$test.out"
     $stderr = Join-Path $output "$test.err"
     $process = Start-Process -FilePath $binary[0] -ArgumentList @($test,'--ignored','--nocapture','--test-threads=1') -WindowStyle Hidden -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru

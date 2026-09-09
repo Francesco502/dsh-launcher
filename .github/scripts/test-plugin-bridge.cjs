@@ -7,6 +7,31 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
+test('catalog keeps missing configured bundle visible while startup inspection stays strict', async t => {
+  const root=fs.mkdtempSync(path.join(os.tmpdir(),'dsh-catalog-missing-'));
+  t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
+  const entry=path.join(root,'node_modules/@deepseek-ai/dsh/lib/bin.js');
+  const boot=path.join(root,'node_modules/@deepseek-ai/dsh-app-boot');
+  fs.mkdirSync(path.dirname(entry),{recursive:true});fs.writeFileSync(entry,'');fs.mkdirSync(boot,{recursive:true});
+  fs.writeFileSync(path.join(boot,'package.json'),JSON.stringify({name:'@deepseek-ai/dsh-app-boot',main:'index.js'}));
+  fs.writeFileSync(path.join(boot,'index.js'),`exports.resolveProfileDir=()=>'';exports.resolveBundleDir=()=>{throw new Error('cannot resolve profile bundle qa-missing')};exports.loadOverlayPatches=()=>[];exports.composeEntries=()=>[];exports.boot=()=>{};`);
+  const home=path.join(root,'home'),profile=path.join(home,'profiles/web');fs.mkdirSync(profile,{recursive:true});
+  fs.writeFileSync(path.join(profile,'package.json'),JSON.stringify({dependencies:{'qa-missing':'1.0.0'},dsh:{profile:{bundles:['qa-missing']}}}));
+  const {inspect}=require('../../src/plugin_bridge.cjs');
+  const result=await inspect(entry,path.join(root,'settings.json'),home,false,true);
+  assert.equal(result.complete,false);assert.equal(result.plugins[0].name,'qa-missing');assert.equal(result.plugins[0].supported,false);
+  assert.equal(result.issues[0].specification,'1.0.0');
+  await assert.rejects(()=>inspect(entry,path.join(root,'settings.json'),home),/cannot resolve profile bundle/);
+  const repairRoot=path.join(home,'profiles/.dsh-launcher-repair-web');
+  fs.mkdirSync(repairRoot);
+  fs.writeFileSync(path.join(repairRoot,'transaction.json'),JSON.stringify({phase:'committing'}));
+  const interrupted=await inspect(entry,path.join(root,'settings.json'),home,false,true);
+  assert.equal(interrupted.complete,false);
+  assert.match(interrupted.error,/修复尚未完成/);
+  await assert.rejects(()=>inspect(entry,path.join(root,'settings.json'),home),/修复尚未完成/);
+  assert.equal((await inspect(entry,path.join(root,'settings.json'),home,false,false,undefined,true)).profileDir,profile);
+});
+
 test('native checks load the addon, reject missing binaries and ABI drift, without initializing plugins', t => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-native-check-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));

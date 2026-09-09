@@ -14,10 +14,16 @@ $helperHash=Get-FileHash -LiteralPath (Join-Path $root 'data\state\log-worker.ex
 $stage=Join-Path $root 'data\updates\launcher-update'
 $files=@('DSH-Launcher.exe','runtime-manifest.json','dshctl.cmd','portable.flag')
 foreach($dir in @($stage,(Join-Path $stage 'candidate'),(Join-Path $stage 'backup'))) { [IO.Directory]::CreateDirectory($dir) | Out-Null }
+foreach($marker in @('helper-ready','window-ready')) {
+    $markerPath=Join-Path $stage $marker
+    if(Test-Path -LiteralPath $markerPath) { Remove-Item -LiteralPath $markerPath }
+}
 foreach($name in $files) { Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $stage 'backup') -Force; Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $stage 'candidate') -Force }
 Copy-Item -LiteralPath $Candidate -Destination (Join-Path $stage 'candidate\DSH-Launcher.exe') -Force
 Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'helper.exe') -Force
-$record=@{phase='prepared';version='0.4.0';token='live-update-test';parent_pid=$parent.Id;parent_created=$parent.StartTime.ToUniversalTime().ToFileTimeUtc();helper_pid=0;helper_created=0}
+$candidateVersion=(Get-Item -LiteralPath $Candidate).VersionInfo.ProductVersion
+if ($candidateVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Candidate must have embedded release version.' }
+$record=@{phase='prepared';version=$candidateVersion;token=[Guid]::NewGuid().ToString('N');parent_pid=$parent.Id;parent_created=$parent.StartTime.ToUniversalTime().ToFileTimeUtc();helper_pid=0;helper_created=0}
 $recordFile=Join-Path $stage 'transaction.json'
 [IO.File]::WriteAllText($recordFile,($record | ConvertTo-Json -Compress))
 $helper=Start-Process -FilePath (Join-Path $stage 'helper.exe') -ArgumentList @('--self-update-apply',('"'+$root+'"'),$record.token) -WindowStyle Hidden -PassThru

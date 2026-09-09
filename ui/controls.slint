@@ -1,0 +1,141 @@
+// Static controls: no decorative motion, including when Windows reduces animations.
+export component Button inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in property <bool> primary;
+    out property <bool> has-focus: keyboard.has-focus;
+    out property <bool> pressed: touch.pressed && root.enabled;
+    callback clicked();
+    forward-focus: keyboard;
+    min-width: max(32px, label.min-width + 24px);
+    min-height: 32px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: root.has-focus ? #0869ad : root.primary ? #0869ad : #dce0e5;
+    background: !root.enabled ? #f5f6f7 : root.primary ? (root.pressed ? #07588f : touch.has-hover ? #0874bd : #0869ad) : root.pressed ? #e9edf1 : touch.has-hover ? #f4f6f8 : #ffffff;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.activate(); }
+    function activate() {
+        if root.enabled { root.clicked(); }
+    }
+    label := Text {
+        text: root.text;
+        color: !root.enabled ? #959ba4 : root.primary ? #ffffff : #30343b;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    if root.has-focus && root.enabled: Rectangle {
+        x: 3px; y: 3px; width: parent.width - 6px; height: parent.height - 6px;
+        background: transparent; border-width: 1px; border-radius: 2px;
+        border-color: root.primary ? #ffffff : #0869ad;
+    }
+    touch := TouchArea { enabled: root.enabled; clicked => { keyboard.focus(); root.activate(); } }
+    keyboard := FocusScope {
+        width: 0px;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == " " || event.text == Key.Return { root.activate(); return accept; }
+            return reject;
+        }
+    }
+}
+
+export component CheckBox inherits Rectangle {
+    in property <string> text;
+    in property <bool> enabled: true;
+    in-out property <bool> checked;
+    out property <bool> has-focus: keyboard.has-focus;
+    callback toggled();
+    forward-focus: keyboard;
+    min-height: max(26px, row.min-height);
+    background: transparent;
+    accessible-role: checkbox;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-checkable: true;
+    accessible-checked <=> root.checked;
+    accessible-action-default => { root.activate(); }
+    function activate() {
+        if root.enabled { root.checked = !root.checked; root.toggled(); }
+    }
+    row := HorizontalLayout {
+        spacing: 10px;
+        Rectangle {
+            width: 18px; height: 18px; vertical-stretch: 0;
+            border-width: 1px; border-radius: 3px;
+            border-color: root.enabled ? #69717d : #cbd0d6;
+            background: root.checked ? (root.enabled ? #0869ad : #cbd0d6) : #ffffff;
+            if root.checked: Path {
+                width: 18px; height: 18px;
+                viewbox-width: 18; viewbox-height: 18;
+                commands: "M 4 9 L 8 13 L 15 5";
+                stroke: #ffffff; stroke-width: 2px;
+            }
+        }
+        Text { text: root.text; color: root.enabled ? #30343b : #959ba4; vertical-alignment: center; wrap: word-wrap; accessible-role: none; }
+    }
+    if keyboard.has-focus: Rectangle { background: transparent; border-width: 1px; border-color: #0869ad; border-radius: 3px; }
+    TouchArea { enabled: root.enabled; clicked => { keyboard.focus(); root.activate(); } }
+    keyboard := FocusScope {
+        width: 0px;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == " " || event.text == Key.Return { root.activate(); return accept; }
+            return reject;
+        }
+    }
+}
+
+export component ScrollView inherits FocusScope {
+    in-out property <length> viewport-width <=> view.viewport-width;
+    min-height: 50px; min-width: 0px;
+    horizontal-stretch: 1; vertical-stretch: 1;
+    preferred-height: 100%; preferred-width: 100%;
+    private property <length> maximum: max(0px, view.viewport-height - view.height);
+    function scroll(delta: length) { view.viewport-y = clamp(view.viewport-y + delta, -root.maximum, 0px); }
+    key-pressed(event) => {
+        if event.text == Key.PageDown { root.scroll(-view.height); return accept; }
+        if event.text == Key.PageUp { root.scroll(view.height); return accept; }
+        if event.text == Key.Home { view.viewport-y = 0px; return accept; }
+        if event.text == Key.End { view.viewport-y = -root.maximum; return accept; }
+        return reject;
+    }
+    view := Flickable {
+        width: parent.width - 12px;
+        height: parent.height;
+        interactive: false;
+        @children
+    }
+    if root.maximum > 0px: Rectangle {
+        x: parent.width - 10px; width: 10px; height: parent.height;
+        background: #f5f6f7;
+        thumb := Rectangle {
+            x: 2px; width: 6px;
+            height: max(20px, parent.height * view.height / view.viewport-height);
+            y: -view.viewport-y / root.maximum * (parent.height - self.height);
+            border-radius: 3px; background: #a1a8b2;
+        }
+        TouchArea {
+            private property <length> start-y;
+            private property <length> start-value;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                    if self.mouse-y < thumb.y { root.scroll(view.height); }
+                    if self.mouse-y > thumb.y + thumb.height { root.scroll(-view.height); }
+                    self.start-y = self.mouse-y; self.start-value = view.viewport-y;
+                }
+            }
+            moved => {
+                if self.pressed && self.height > thumb.height {
+                    view.viewport-y = clamp(self.start-value - (self.mouse-y - self.start-y) * root.maximum / (self.height - thumb.height), -root.maximum, 0px);
+                }
+            }
+            scroll-event(event) => { root.scroll(event.delta-y); return accept; }
+        }
+    }
+}

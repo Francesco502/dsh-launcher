@@ -6,7 +6,6 @@ use windows_sys::Win32::System::Threading::{
     WaitForMultipleObjects, EVENT_MODIFY_STATE, INFINITE, WT_EXECUTEONLYONCE,
 };
 
-static WINDOW: AtomicUsize = AtomicUsize::new(0);
 static GENERATION: AtomicUsize = AtomicUsize::new(0);
 static TRACKED: Mutex<Option<Verified>> = Mutex::new(None);
 
@@ -30,17 +29,11 @@ impl Drop for Verified {
     }
 }
 unsafe extern "system" fn exited(context: *mut c_void, _: bool) {
-    let hwnd = WINDOW.load(Ordering::Acquire) as HWND;
-    if !hwnd.is_null() {
-        PostMessageW(hwnd, PROCESS_EXIT_MESSAGE, context as usize, 0);
-    }
+    ui::process_exit(context as usize);
 }
-pub(super) fn set_window(hwnd: HWND) {
-    WINDOW.store(hwnd as usize, Ordering::Release);
-    if hwnd.is_null() {
-        if let Ok(mut value) = TRACKED.try_lock() {
-            *value = None;
-        }
+pub(super) fn release_observer() {
+    if let Ok(mut value) = TRACKED.lock() {
+        *value = None;
     }
 }
 pub(super) fn current_exit(generation: usize) -> bool {

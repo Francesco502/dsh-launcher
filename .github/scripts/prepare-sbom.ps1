@@ -32,6 +32,9 @@ foreach ($package in @($metadata.packages)) {
         versionInfo = $package.version
         downloadLocation = if ($package.source) { $package.source } else { "NOASSERTION" }
         filesAnalyzed = $false
+        licenseDeclared = if ($package.license -and $package.license -notmatch 'LicenseRef-') { $package.license } else { 'NOASSERTION' }
+        licenseConcluded = if ($package.license -match 'LicenseRef-Slint-Royalty-free-2.0') { 'LicenseRef-Slint-Royalty-free-2.0' } else { 'NOASSERTION' }
+        licenseComments = if ($package.license) { "Cargo declared license alternatives: $($package.license)" } else { 'Consult the package license file.' }
     }
 }
 
@@ -54,6 +57,13 @@ $manifest = [ordered]@{
         creators = @( "Tool: DSH Launcher prepare-sbom.ps1" )
     }
     packages = $packages
+    comment = 'Cargo dependency graph includes build-time and target-specific packages; the separately listed DSH runtime is selected at installation and is not bundled.'
+    hasExtractedLicensingInfos = @([ordered]@{
+        licenseId = 'LicenseRef-Slint-Royalty-free-2.0'
+        name = 'Slint Royalty-free License 2.0'
+        extractedText = Get-Content -Raw -LiteralPath (Join-Path $repositoryRoot 'licenses/Slint-Royalty-free-2.0.md')
+        seeAlsos = @('https://slint.dev/license')
+    })
 }
 $parent = Split-Path -Parent $OutputPath
 New-Item -ItemType Directory -Path $parent -Force | Out-Null

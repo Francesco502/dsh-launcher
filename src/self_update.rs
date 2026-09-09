@@ -8,9 +8,6 @@ const FILES: [&str; 4] = [
     "portable.flag",
 ];
 const DIRECTORY: &str = "launcher-update";
-pub(super) const EXIT: u32 = WM_APP + 8;
-pub(super) const READY: u32 = WM_APP + 9;
-pub(super) const CONFIRM: u32 = WM_APP + 10;
 static READY_FILE: OnceLock<PathBuf> = OnceLock::new();
 
 fn stage(root: &Path) -> PathBuf {
@@ -155,14 +152,9 @@ fn schedule_recovery(root: &Path, mut record: serde_json::Value) -> Result<bool,
     Err("恢复助手未就绪，已保留备份".to_owned())
 }
 
-pub(super) fn confirm(hwnd: HWND, message: &str) -> bool {
-    let message = message.to_owned();
-    unsafe { SendMessageW(hwnd, CONFIRM, 0, &message as *const String as isize) != 0 }
-}
-
 pub(super) fn prepare(
     paths: &Paths,
-    hwnd: HWND,
+    confirm: &dyn Fn(&str) -> bool,
     progress: &dyn Fn(&str, bool),
 ) -> Result<bool, String> {
     let script = format!("$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';$r=Invoke-RestMethod -UseBasicParsing -TimeoutSec 15 -Headers @{{'User-Agent'='DSH-Launcher'}} -Uri '{RELEASE_API_URL}';if($r.draft -or $r.prerelease){{throw 'Not a stable release'}};[Console]::Out.Write($r.tag_name)");
@@ -191,7 +183,7 @@ pub(super) fn prepare(
         progress("启动器已是最新版本", false);
         return Ok(false);
     }
-    if !confirm(hwnd, &format!("将启动器 v{APP_VERSION} 更新到 v{latest}。\n更新后重新打开窗口，运行中的 DSH 保持运行。\n\n继续？")) { return Err("操作已取消".to_owned()); }
+    if !confirm(&format!("将启动器 v{APP_VERSION} 更新到 v{latest}。\n更新后重新打开窗口，运行中的 DSH 保持运行。\n\n继续？")) { return Err("操作已取消".to_owned()); }
     let root = paths.data.parent().ok_or("启动器目录无效")?;
     if recover(root)? {
         return Err("启动器正在恢复，请重新打开".to_owned());

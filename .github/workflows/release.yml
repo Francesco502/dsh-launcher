@@ -58,10 +58,19 @@ jobs:
         run: node --test .github/scripts/test-browser-entry.cjs
 
       - name: Test plugin selection and startup overrides
-        run: node --test .github/scripts/test-plugin-bridge.cjs
+        run: node --test .github/scripts/test-plugin-bridge.cjs .github/scripts/test-plugin-repair.cjs
 
       - name: Test private graceful stop pipe
         run: node --test .github/scripts/test-stop-pipe.cjs
+
+      - name: Test real npm connection failure and Windows file-lock rollback
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $env:DSH_TEST_NPM_CLI = Join-Path (Split-Path (Get-Command npm.cmd).Source) 'node_modules\npm\bin\npm-cli.js'
+          if (!(Test-Path -LiteralPath $env:DSH_TEST_NPM_CLI)) { throw 'npm CLI fixture dependency missing' }
+          node --test .github/scripts/test-plugin-repair-integration.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Plugin repair integration failed' }
 
       - name: Clippy
         run: cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
@@ -69,7 +78,7 @@ jobs:
       - name: Test Windows MSVC target
         run: cargo test --locked --target x86_64-pc-windows-msvc
 
-      - name: Test native dialog painting and lifetime
+      - name: Test Slint opaque rendering and window lifetime
         shell: pwsh
         run: |
           & .github\scripts\test-dialogs.ps1 -Target x86_64-pc-windows-gnu
@@ -101,9 +110,9 @@ jobs:
             throw "src/main.rs has $mainLines lines; the 0.3.1 limit is 6500."
           }
           $candidate = Get-Item -LiteralPath "target\x86_64-pc-windows-gnu\release\dsh-launcher.exe"
-          $maxBytes = 1238093
+          $maxBytes = 16 * 1024 * 1024
           if ($candidate.Length -gt $maxBytes) {
-            throw "Release EXE is $($candidate.Length) bytes; the 0.3.0 plus 5 percent limit is $maxBytes bytes."
+            throw "Release EXE is $($candidate.Length) bytes; the Slint 0.5.0 size budget is $maxBytes bytes."
           }
 
       - name: Prepare portable Windows bundle
@@ -282,6 +291,7 @@ jobs:
               "",
               $section.Groups[1].Value.Trim(),
               "",
+              "UI powered by [Slint](https://slint.dev), used under [Slint Royalty-free License 2.0](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_REF_NAME/licenses/Slint-Royalty-free-2.0.md). Slint attribution is also available in the application About view. Project source remains MIT licensed; third-party code retains its own licenses.",
               "CLI compatibility: the public commands are start, stop, upgrade, and open. The removed restart, repair, migrate, launcher-update, data, and --data-dir forms are no longer accepted.",
               "Runtime requirement: DSH-Launcher-Portable-x64.zip is the supported lightweight package and contains no Node.js or DSH runtime. Install Node.js separately when it is absent; DSH installation and upgrades are explicit user actions.",
               "Launcher updates: use the footer Check for launcher updates action, confirm the newer release, then let the launcher download, verify and transactionally replace the four portable program files. Failed readiness restores the old file group; DSH and user data remain intact. The first upgrade from 0.3.3 to 0.4.0 still requires installing the full portable bundle.",

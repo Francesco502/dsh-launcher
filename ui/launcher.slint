@@ -1,0 +1,229 @@
+import { AboutSlint } from "std-widgets.slint";
+import { Button as StandardButton, CheckBox as StandardCheckBox, ScrollView } from "controls.slint";
+
+global FocusReturn {
+    in-out property <string> target;
+    in-out property <bool> modal;
+    in-out property <int> serial;
+}
+
+component Button inherits StandardButton {
+    in property <string> focus-key: self.text;
+    private property <int> restore-serial: FocusReturn.serial;
+    changed has-focus => {
+        if self.has-focus && !FocusReturn.modal { FocusReturn.target = self.focus-key; }
+    }
+    changed pressed => {
+        if self.pressed && !FocusReturn.modal { FocusReturn.target = self.focus-key; }
+    }
+    changed restore-serial => {
+        restore.running = true;
+    }
+    changed enabled => {
+        if self.enabled { restore.running = true; }
+    }
+    // Property bindings may be evaluated while AccessKit borrows its tree.
+    // Restore focus on the next event-loop turn, never during that traversal.
+    restore := Timer {
+        interval: 1ms; running: false;
+        triggered => {
+            self.running = false;
+            if root.enabled && !FocusReturn.modal && root.focus-key == FocusReturn.target { root.focus(); }
+        }
+    }
+}
+
+component CheckBox inherits StandardCheckBox {
+    private property <int> restore-serial: FocusReturn.serial;
+    changed has-focus => {
+        if self.has-focus && !FocusReturn.modal { FocusReturn.target = self.text; }
+    }
+    changed restore-serial => {
+        restore.running = true;
+    }
+    restore := Timer {
+        interval: 1ms; running: false;
+        triggered => {
+            self.running = false;
+            if root.enabled && !FocusReturn.modal && root.text == FocusReturn.target { root.focus(); }
+        }
+    }
+}
+
+export struct PluginRow { name: string, detail: string, enabled: bool, supported: bool }
+
+component SecondaryButton inherits Button {
+    min-width: 0px;
+    preferred-width: 0px;
+    horizontal-stretch: 1;
+    height: 36px;
+}
+
+export component LauncherTray inherits SystemTrayIcon {
+    in-out property <bool> shown: true;
+    visible: root.shown;
+    in property <bool> running;
+    in property <bool> busy;
+    callback show-panel();
+    callback main-action();
+    callback open-web();
+    callback exit-app();
+    icon: running ? @image-url("whale-blue.svg") : @image-url("whale.svg");
+    tooltip: running ? "DSH运行中" : "DSH未启动";
+    clicked => { root.show-panel(); }
+    Menu {
+        MenuItem { title: "打开面板"; activated => { root.show-panel(); } }
+        MenuItem { title: running ? "停止 DSH" : "启动 DSH"; enabled: !busy; activated => { root.main-action(); } }
+        MenuItem { title: "打开 Web UI"; enabled: running && !busy; activated => { root.open-web(); } }
+        MenuSeparator {}
+        MenuItem { title: "退出"; enabled: !busy; activated => { root.exit-app(); } }
+    }
+}
+
+export component LauncherWindow inherits Window {
+    title: "DSH启动器";
+    preferred-width: 520px;
+    preferred-height: 440px;
+    min-width: 440px;
+    min-height: 420px;
+    background: #ffffff;
+    default-font-family: "Microsoft YaHei UI";
+    default-font-size: 14px;
+    icon: running ? @image-url("whale-blue.svg") : @image-url("whale.svg");
+    in property <bool> running;
+    in property <bool> busy;
+    in property <bool> main-enabled;
+    in property <bool> web-enabled;
+    in property <bool> restart-enabled;
+    in property <bool> plugins-enabled;
+    in property <bool> update-enabled;
+    in property <bool> initialized;
+    in property <string> status: "正在检查本机 DSH…";
+    in property <string> task;
+    in property <string> main-label: "正在检查…";
+    in property <string> version;
+    in-out property <int> page;
+    in-out property <[PluginRow]> plugins;
+    in property <string> plugin-note;
+    in property <bool> can-save;
+    in property <bool> can-repair;
+    in-out property <bool> dirty;
+    in property <string> modal-title;
+    in property <string> modal-text;
+    in property <string> copy-label: "复制详情";
+    in property <string> error-summary;
+    in property <bool> error-recovery;
+    in-out property <bool> details-expanded;
+    in property <bool> confirming;
+    in property <bool> modal-visible;
+    changed modal-visible => {
+        FocusReturn.modal = root.modal-visible;
+        if !root.modal-visible { FocusReturn.serial += 1; }
+    }
+    callback action(string);
+    callback answer(bool);
+    callback toggle(int, bool);
+    callback leave-plugins();
+
+    body := FocusScope {
+      enabled: !root.modal-visible;
+      key-pressed(event) => {
+        if event.text == Key.Escape && root.page == 1 { root.leave-plugins(); return accept; }
+        return reject;
+      }
+      VerticalLayout {
+        padding: 24px; spacing: 16px;
+        HorizontalLayout {
+            Text { text: root.page == 1 ? "插件" : "DSH 启动器"; font-size: 24px; font-weight: 600; color: #17191d; }
+            Rectangle { horizontal-stretch: 1; }
+            if root.page == 1: Button { text: "返回"; enabled: !root.modal-visible; clicked => { root.leave-plugins(); } }
+        }
+        Rectangle { height: 1px; background: #e8e9eb; }
+        if root.page == 0: VerticalLayout {
+            spacing: 16px;
+            Text { text: root.status; color: #30343b; wrap: word-wrap; }
+            Text { text: root.task; color: #69717d; wrap: word-wrap; min-height: 40px; }
+            Rectangle { vertical-stretch: 1; }
+            Button { text: root.main-label; height: 40px; enabled: root.main-enabled && !root.modal-visible; primary: true; clicked => { root.action("main"); } }
+            GridLayout {
+                spacing: 12px;
+                Row {
+                    SecondaryButton { text: "打开 Web UI"; enabled: root.web-enabled && !root.modal-visible; clicked => { root.action("web"); } }
+                    SecondaryButton { text: "重启 DSH"; enabled: root.restart-enabled && !root.modal-visible; clicked => { root.action("restart"); } }
+                }
+                Row {
+                    SecondaryButton { text: "选择插件"; enabled: root.plugins-enabled && !root.modal-visible; clicked => { root.action("plugins"); } }
+                    SecondaryButton { text: "更新 DSH"; enabled: root.update-enabled && !root.modal-visible; clicked => { root.action("update"); } }
+                }
+            }
+        }
+        if root.page == 1: VerticalLayout {
+            spacing: 12px;
+            Text { text: root.plugin-note; color: root.can-save || root.busy ? #69717d : #a13232; wrap: word-wrap; }
+            ScrollView {
+                viewport-width: self.width - 12px;
+                VerticalLayout {
+                    padding: 0px; spacing: 8px;
+                    for row[index] in root.plugins: VerticalLayout {
+                        spacing: 4px;
+                        CheckBox { text: row.name; checked: row.enabled; enabled: row.supported && root.can-save && !root.busy && !root.modal-visible; toggled => { root.toggle(index, self.checked); } }
+                        Text { text: row.detail; color: #69717d; wrap: word-wrap; font-size: 12px; min-height: self.preferred-height; vertical-stretch: 0; }
+                        Rectangle { height: 1px; background: #eeeeef; }
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 12px;
+                Button { text: "修复依赖"; enabled: root.can-repair && !root.busy && !root.modal-visible; clicked => { root.action("repair-plugins"); } }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: "取消"; enabled: !root.modal-visible; clicked => { root.leave-plugins(); } }
+                Button { text: "保存"; primary: true; enabled: root.can-save && !root.busy && !root.modal-visible; clicked => { root.action("save-plugins"); } }
+            }
+        }
+        HorizontalLayout {
+            Button { text: "v" + root.version + " · 检查更新"; enabled: root.initialized && !root.busy && !root.modal-visible; clicked => { root.action("launcher-update"); } }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "关于"; enabled: !root.busy && !root.modal-visible; clicked => { root.action("about"); } }
+        }
+      }
+    }
+    if root.modal-visible: dialog := FocusScope {
+      Timer { interval: 1ms; running: true; triggered => { self.running = false; dialog.focus(); } }
+      key-pressed(event) => {
+        if event.modifiers.control && (event.text == "c" || event.text == "C") { root.action("copy"); return accept; }
+        if event.text == Key.Escape { root.answer(false); return accept; }
+        if event.text == Key.Return && !root.confirming { root.answer(true); return accept; }
+        return reject;
+      }
+      Rectangle {
+        background: #ffffff;
+        // Opaque in-window content avoids native owned-window activation races.
+        VerticalLayout {
+            padding: 24px; spacing: 16px;
+            Text { text: root.modal-title; font-size: 22px; font-weight: 600; color: #17191d; }
+            Rectangle { height: 1px; background: #e8e9eb; }
+            if root.modal-title == "DSH 启动器": AboutSlint { height: 112px; }
+            if root.modal-title == "操作未完成": HorizontalLayout {
+                Button { text: root.details-expanded ? "收起详情" : "显示详情"; clicked => { root.details-expanded = !root.details-expanded; } }
+                Rectangle { horizontal-stretch: 1; }
+                if root.error-recovery: Button { text: "查看插件"; enabled: !root.busy; clicked => { root.action("error-plugins"); } }
+            }
+            ScrollView {
+                viewport-width: self.width - 12px;
+                VerticalLayout {
+                    padding: 0px;
+                    Text { text: root.modal-title == "操作未完成" && !root.details-expanded ? root.error-summary : root.modal-text; color: #30343b; wrap: word-wrap; min-width: 0px; min-height: self.preferred-height; vertical-stretch: 0; }
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+            HorizontalLayout {
+                spacing: 12px;
+                Button { text: root.copy-label; clicked => { root.action("copy"); } }
+                Rectangle { horizontal-stretch: 1; }
+                if root.confirming: Button { text: "取消"; clicked => { root.answer(false); } }
+                Button { text: root.confirming ? "确认" : "确定"; clicked => { root.answer(true); } }
+            }
+        }
+      }
+    }
+}

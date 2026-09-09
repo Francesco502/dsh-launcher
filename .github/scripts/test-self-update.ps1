@@ -1,10 +1,12 @@
 param([Parameter(Mandatory)][string]$LauncherPath, [Parameter(Mandatory)][string]$WorkDirectory,
-      [Parameter(Mandatory)][string]$OldLauncherPath)
+      [Parameter(Mandatory)][string]$OldLauncherPath, [string]$ParentLauncherPath)
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'launcher-window.ps1')
 $source = (Resolve-Path -LiteralPath $LauncherPath).Path
 $version = (Get-Item -LiteralPath $source).VersionInfo.ProductVersion
 if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Test requires an embedded release version.' }
 $oldSource = (Resolve-Path -LiteralPath $OldLauncherPath).Path
+$parentSource = if ($ParentLauncherPath) { (Resolve-Path -LiteralPath $ParentLauncherPath).Path } else { $source }
 $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $work = [IO.Path]::GetFullPath($WorkDirectory)
 if (!$work.StartsWith($repo + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Test directory must be in repository.' }
@@ -29,12 +31,13 @@ foreach ($case in @('success','candidate-fails','file-locked','interrupted')) {
     $candidate = Join-Path $stage 'candidate'
     $backup = Join-Path $stage 'backup'
     foreach ($dir in @($root,$stage,$candidate,$backup,(Join-Path $root 'data\state'))) { [IO.Directory]::CreateDirectory($dir) | Out-Null }
-    Copy-Item -LiteralPath $source -Destination (Join-Path $root 'DSH-Launcher.exe') -Force
+    Copy-Item -LiteralPath $parentSource -Destination (Join-Path $root 'DSH-Launcher.exe') -Force
     Copy-Item -LiteralPath (Join-Path $repo 'runtime-manifest.json') -Destination $root -Force
     [IO.File]::WriteAllText((Join-Path $root 'dshctl.cmd'),'old-cli')
     [IO.File]::WriteAllText((Join-Path $root 'portable.flag'),'')
     [IO.File]::WriteAllText((Join-Path $root 'data\state\sentinel'),'keep-user-data')
     foreach ($file in $files) { Copy-Item -LiteralPath (Join-Path $root $file) -Destination $backup -Force; Copy-Item -LiteralPath (Join-Path $root $file) -Destination $candidate -Force }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $candidate 'DSH-Launcher.exe') -Force
     [IO.File]::WriteAllText((Join-Path $candidate 'dshctl.cmd'),'new-cli')
     if ($case -eq 'candidate-fails') { Copy-Item -LiteralPath $oldSource -Destination (Join-Path $candidate 'DSH-Launcher.exe') -Force }
     $expectedHashes = @{}
@@ -52,10 +55,10 @@ foreach ($case in @('success','candidate-fails','file-locked','interrupted')) {
             Start-Process -FilePath (Join-Path $root 'DSH-Launcher.exe') -WindowStyle Hidden | Out-Null
         } else {
             $parent = Start-Process -FilePath (Join-Path $root 'DSH-Launcher.exe') -PassThru
-            Wait-For { $parent.Refresh(); if ($parent.HasExited) { throw "Fixture parent exited: $case ($($parent.ExitCode))" }; $parent.MainWindowHandle -ne 0 }
+            Wait-For { $parent.Refresh(); if ($parent.HasExited) { throw "Fixture parent exited: $case ($($parent.ExitCode))" }; [LauncherWindowProbe]::Count($parent.Id) -eq 1 }
             $parentId = $parent.Id
             $record.parent_pid=$parent.Id; $record.parent_created=$parent.StartTime.ToUniversalTime().ToFileTimeUtc()
-            Copy-Item -LiteralPath $source -Destination (Join-Path $stage 'helper.exe') -Force
+            Copy-Item -LiteralPath $parentSource -Destination (Join-Path $stage 'helper.exe') -Force
             [IO.File]::WriteAllText($recordFile, ($record | ConvertTo-Json -Compress))
             $helper = Start-Process -FilePath (Join-Path $stage 'helper.exe') -ArgumentList @('--self-update-apply', ('"'+$root+'"'), $record.token) -WindowStyle Hidden -PassThru
             $record.helper_pid=$helper.Id; $record.helper_created=$helper.StartTime.ToUniversalTime().ToFileTimeUtc()
@@ -69,7 +72,7 @@ foreach ($case in @('success','candidate-fails','file-locked','interrupted')) {
         Wait-For {
             # The restored ordinary launcher legitimately removes a completed record.
             # Require its actual window, not just the helper's terminal phase.
-            $replacement = @(Get-Process | Where-Object { $_.Path -eq (Join-Path $root 'DSH-Launcher.exe') -and $_.Id -ne $parentId -and $_.MainWindowHandle -ne 0 })
+            $replacement = @(Get-Process | Where-Object { $_.Path -eq (Join-Path $root 'DSH-Launcher.exe') -and $_.Id -ne $parentId -and [LauncherWindowProbe]::Count($_.Id) -eq 1 })
             if ($replacement.Count -ne 1) { return $false }
             if (Test-Path -LiteralPath $recordFile) {
                 try { if ((Get-Content -Raw -LiteralPath $recordFile | ConvertFrom-Json).phase -notin @('done','restored')) { return $false } } catch { return $false }

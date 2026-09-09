@@ -59,10 +59,19 @@ jobs:
         run: node --test .github/scripts/test-browser-entry.cjs
 
       - name: Test plugin selection and startup overrides
-        run: node --test .github/scripts/test-plugin-bridge.cjs
+        run: node --test .github/scripts/test-plugin-bridge.cjs .github/scripts/test-plugin-repair.cjs
 
       - name: Test private graceful stop pipe
         run: node --test .github/scripts/test-stop-pipe.cjs
+
+      - name: Test real npm connection failure and Windows file-lock rollback
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          $env:DSH_TEST_NPM_CLI = Join-Path (Split-Path (Get-Command npm.cmd).Source) 'node_modules\npm\bin\npm-cli.js'
+          if (!(Test-Path -LiteralPath $env:DSH_TEST_NPM_CLI)) { throw 'npm CLI fixture dependency missing' }
+          node --test .github/scripts/test-plugin-repair-integration.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Plugin repair integration failed' }
 
       - name: Clippy GNU target
         run: cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
@@ -73,7 +82,7 @@ jobs:
       - name: Test MSVC target
         run: cargo test --locked --target x86_64-pc-windows-msvc
 
-      - name: Test native dialog painting and lifetime
+      - name: Test Slint opaque rendering and window lifetime
         shell: pwsh
         run: |
           & .github\scripts\test-dialogs.ps1 -Target x86_64-pc-windows-gnu
@@ -105,9 +114,9 @@ jobs:
             throw "src/main.rs has $mainLines lines; the 0.3.1 limit is 6500."
           }
           $candidate = Get-Item -LiteralPath "target\x86_64-pc-windows-gnu\release\dsh-launcher.exe"
-          $maxBytes = 1238093
+          $maxBytes = 16 * 1024 * 1024
           if ($candidate.Length -gt $maxBytes) {
-            throw "Release EXE is $($candidate.Length) bytes; the 0.3.0 plus 5 percent limit is $maxBytes bytes."
+            throw "Release EXE is $($candidate.Length) bytes; the Slint 0.5.0 size budget is $maxBytes bytes."
           }
 
       - name: Prepare portable bundle

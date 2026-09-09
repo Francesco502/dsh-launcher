@@ -566,6 +566,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn slint_icons_preserve_the_executable_icon_geometry() {
+        for svg in [
+            include_str!("../../ui/whale.svg"),
+            include_str!("../../ui/whale-blue.svg"),
+        ] {
+            let attribute = |name: &str| {
+                svg.split_once(&format!("{name}=\""))
+                    .unwrap()
+                    .1
+                    .split_once('"')
+                    .unwrap()
+                    .0
+            };
+            assert_eq!(attribute("width"), attribute("height"));
+            assert_eq!(attribute("d"), DEEPSEEK_WHALE_PATH);
+            let bounds: Vec<f32> = attribute("viewBox")
+                .split_whitespace()
+                .map(|value| value.parse().unwrap())
+                .collect();
+            assert_eq!(bounds.len(), 4);
+            assert_eq!(bounds[2], bounds[3], "Windows icon slots are square");
+            assert!((bounds[2].recip() - WHALE_SCALE).abs() < 0.000001);
+            assert!(((WHALE_MIN_X - bounds[0]) / bounds[2] - WHALE_OFFSET_X).abs() < 0.000001);
+            assert!(((WHALE_MIN_Y - bounds[1]) / bounds[3] - WHALE_OFFSET_Y).abs() < 0.000001);
+        }
+    }
+
+    #[test]
     fn icon_dib_has_header_pixels_and_mask() {
         let icon = generate_icon_dib(16, false);
         assert_eq!(&icon[0..4], &40u32.to_le_bytes());
