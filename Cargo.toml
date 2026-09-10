@@ -1,12 +1,13 @@
 [package]
 name = "dsh-launcher"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Low-resource Windows tray launcher for DeepSeek Harness"
 license = "MIT"
 
 [features]
 test-hooks = []
+test-isolated-port = ["test-hooks"]
 
 [dependencies]
 slint = { version = "=1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2", "system-tray"] }

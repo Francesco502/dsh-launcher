@@ -57,7 +57,7 @@ function planPlugins(records, entries, overrides, compose) {
       }
     }
     const collisions = [...new Set(record.roots.flatMap(root => [...(owners.get(root.id) || [])]).filter(name => name !== record.name))];
-    return { name: record.name, aliases: record.aliases, version: record.version, enabled, supported, conflict,
+    return { name: record.name, aliases: record.aliases, version: record.version, enabled, supported, conflict, ...(record.builtin ? {builtin: true} : {}),
       reason: conflict ? '别名选择冲突，暂按停用；保存可统一' : !supported ? (collisions.length ? `加载 ID 冲突：${collisions.join('、')}` : '没有独立加载入口') : '' };
   });
   if (compose) {
@@ -135,7 +135,7 @@ async function inspect(entry, settingsFile, portableHome, preflight = false, dia
     const patches = core.loadOverlayPatches('dsh', path.join(dir, patchFile));
     if (loaded) layers.push(patches);
     if (Object.hasOwn(manifest.dependencies || {}, name)) records.push({ name, version: pkg.version, patches, loaded,
-      directory: fs.realpathSync(dir), identity: `${pkg.name}@${pkg.version}:${JSON.stringify(patches)}` });
+      directory: fs.realpathSync(dir), builtin: fs.realpathSync(dir).toLowerCase().startsWith(fs.realpathSync(path.resolve(path.dirname(entry), '../../..')).toLowerCase() + path.sep), identity: `${pkg.name}@${pkg.version}:${JSON.stringify(patches)}` });
     } catch (error) {
       if (!diagnostic) throw error;
       issues.push({ name, source: manifestFile, specification: manifest.dependencies?.[name] || '', reason: error.message });
@@ -143,7 +143,7 @@ async function inspect(entry, settingsFile, portableHome, preflight = false, dia
   }
   const userPatch = path.join(profileDir, 'cordis.patch.yml');
   if (fs.existsSync(userPatch)) layers.push(core.loadOverlayPatches('dsh', userPatch));
-  const homePatch = path.join(portableHome || path.resolve(profileDir, '..', '..'), 'cordis.patch.yml');
+  const homePatch = path.join(portableHome || path.resolve(originalProfileDir, '..', '..'), 'cordis.patch.yml');
   if (fs.existsSync(homePatch)) layers.push(core.loadOverlayPatches('dsh', homePatch));
   const result = planPlugins(records, core.composeEntries(layers), overrides, core.composeEntries);
   if (preflight) {

@@ -59,7 +59,12 @@ jobs:
         run: node --test .github/scripts/test-browser-entry.cjs
 
       - name: Test plugin selection and startup overrides
-        run: node --test .github/scripts/test-plugin-bridge.cjs .github/scripts/test-plugin-repair.cjs
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $env:DSH_TEST_NPM_CLI = Join-Path (Split-Path (Get-Command npm.cmd).Source) 'node_modules\npm\bin\npm-cli.js'
+          node --test .github/scripts/test-plugin-bridge.cjs .github/scripts/test-plugin-repair.cjs .github/scripts/test-plugin-update.cjs .github/scripts/test-plugin-update-integration.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Plugin tests failed' }
 
       - name: Test private graceful stop pipe
         run: node --test .github/scripts/test-stop-pipe.cjs

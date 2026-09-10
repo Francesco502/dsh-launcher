@@ -3,6 +3,8 @@ export component Button inherits Rectangle {
     in property <string> text;
     in property <bool> enabled: true;
     in property <bool> primary;
+    in property <bool> text-only;
+    in property <string> accessible-name: root.text;
     out property <bool> has-focus: keyboard.has-focus;
     out property <bool> pressed: touch.pressed && root.enabled;
     callback clicked();
@@ -12,11 +14,11 @@ export component Button inherits Rectangle {
     horizontal-stretch: 0;
     vertical-stretch: 0;
     border-radius: 4px;
-    border-width: 1px;
+    border-width: root.text-only ? 0px : 1px;
     border-color: root.has-focus ? #0869ad : root.primary ? #0869ad : #dce0e5;
-    background: !root.enabled ? #f5f6f7 : root.primary ? (root.pressed ? #07588f : touch.has-hover ? #0874bd : #0869ad) : root.pressed ? #e9edf1 : touch.has-hover ? #f4f6f8 : #ffffff;
+    background: root.text-only ? (touch.has-hover && root.enabled ? #f4f6f8 : transparent) : !root.enabled ? #f5f6f7 : root.primary ? (root.pressed ? #07588f : touch.has-hover ? #0874bd : #0869ad) : root.pressed ? #e9edf1 : touch.has-hover ? #f4f6f8 : #ffffff;
     accessible-role: button;
-    accessible-label: root.text;
+    accessible-label: root.accessible-name;
     accessible-enabled: root.enabled;
     accessible-action-default => { root.activate(); }
     function activate() {

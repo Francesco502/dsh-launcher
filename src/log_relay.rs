@@ -18,7 +18,13 @@ pub(super) fn is_worker(args: &[String]) -> bool {
     } else {
         &args[6..]
     };
-    tail == ["--no-open", "--host", "127.0.0.1", "--port", "3080"]
+    tail == [
+        "--no-open",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &super::DSH_PORT.to_string(),
+    ]
 }
 
 pub(super) fn run(
@@ -39,7 +45,13 @@ pub(super) fn run(
         }
         command.arg("--patch").arg(patch);
     }
-    command.args(["--no-open", "--host", "127.0.0.1", "--port", "3080"]);
+    command.args([
+        "--no-open",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &super::DSH_PORT.to_string(),
+    ]);
     collect(&mut command, &paths.logs)
 }
 

@@ -410,6 +410,22 @@ impl Panel {
             self.load_plugins();
             return;
         }
+        if self.prompt.is_none()
+            && self
+                .window
+                .as_ref()
+                .is_some_and(|w| w.get_modal_visible() && w.get_modal_title() == "DSH 启动器")
+        {
+            if action == "project" {
+                if let Err(error) = open_url("https://github.com/Francesco502/dsh-launcher") {
+                    self.error(error);
+                }
+                return;
+            }
+            if action == "launcher-update" {
+                self.answer(false);
+            }
+        }
         if self.prompt.is_some() || self.window.as_ref().is_some_and(|w| w.get_modal_visible()) {
             return;
         }
@@ -426,9 +442,16 @@ impl Panel {
         let snapshot = self.backend.snapshot.lock().unwrap().clone();
         match action {
             "main" => match main_button(&snapshot, false, false) {
-                MainButton::Start => self.operate(Operation::Start), MainButton::Stop => self.operate(Operation::Stop),
-                MainButton::InstallDsh => self.operate(Operation::Install), MainButton::RepairDsh => self.operate(Operation::Upgrade),
-                MainButton::InstallNode => { if let Err(e) = open_url(NODE_DOWNLOAD_URL) { self.error(e); } }, _ => {}
+                MainButton::Start => self.operate(Operation::Start),
+                MainButton::Stop => self.operate(Operation::Stop),
+                MainButton::InstallDsh => self.operate(Operation::Install),
+                MainButton::RepairDsh => self.operate(Operation::Upgrade),
+                MainButton::InstallNode => {
+                    if let Err(e) = open_url(NODE_DOWNLOAD_URL) {
+                        self.error(e);
+                    }
+                }
+                _ => {}
             },
             "web" if snapshot.healthy => self.operate(Operation::Open),
             "restart" if restart_allowed(&snapshot, false) => self.operate(Operation::Restart),
@@ -436,21 +459,63 @@ impl Panel {
             "plugins" => self.load_plugins(),
             "save-plugins" => self.save_plugins(),
             "repair-plugins" => self.repair_plugins(),
+            "update-plugins" => {
+                if self.window.as_ref().is_some_and(|w| w.get_dirty()) {
+                    self.modal(
+                        "请先保存插件选择",
+                        "更新使用已保存的启用插件。请先保存或取消当前修改。",
+                        false,
+                    );
+                } else {
+                    let backend = self.begin("正在检查所选插件更新…", true);
+                    thread::spawn(move || {
+                        let result = (|| {
+                            let _guard = acquire_action_mutex().ok_or("已有启动器操作正在执行")?;
+                            recover_for_use(&backend.paths)?;
+                            joint_update::update(
+                                true,
+                                &|text, cancelable| progress(&backend, text, cancelable),
+                                Some(&confirm),
+                            )
+                        })();
+                        let message = result.as_ref().ok().cloned();
+                        complete(backend, result);
+                        if let Some(message) = message {
+                            dispatch(move |panel| {
+                                if panel.window.as_ref().is_some_and(|w| w.get_page() == 1) {
+                                    panel.load_plugins();
+                                    panel.modal("插件更新结果", &message, false);
+                                }
+                            });
+                        }
+                    });
+                }
+            }
             "launcher-update" => {
                 let backend = self.begin("正在检查启动器更新…", true);
                 thread::spawn(move || {
                     let result = (|| {
                         let _guard = acquire_action_mutex().ok_or("已有启动器操作正在执行")?;
-                        self_update::prepare(&backend.paths, &confirm, &|text, cancelable| progress(&backend, text, cancelable))
+                        self_update::prepare(&backend.paths, &confirm, &|text, cancelable| {
+                            progress(&backend, text, cancelable)
+                        })
                     })();
                     match result {
-                        Ok(true) => { let _ = slint::quit_event_loop(); }
-                        Ok(false) => complete(backend, Ok(format!("启动器已是最新版本 · v{APP_VERSION}"))),
+                        Ok(true) => {
+                            let _ = slint::quit_event_loop();
+                        }
+                        Ok(false) => {
+                            complete(backend, Ok(format!("启动器已是最新版本 · v{APP_VERSION}")))
+                        }
                         Err(e) => complete(backend, Err(e)),
                     }
                 });
             }
-            "about" => self.modal("DSH 启动器", &format!("v{APP_VERSION}\n\n简洁、专注的本地 DSH 管理工具。\n\n界面使用 Slint — https://slint.dev\nSlint Royalty-free License 2.0\n项目代码：MIT"), false),
+            "about" => self.modal(
+                "DSH 启动器",
+                &format!("v{APP_VERSION}\n\n简洁、专注的本地 DSH 管理工具。"),
+                false,
+            ),
             _ => {}
         }
     }
@@ -646,6 +711,9 @@ fn confirm(text: &str) -> bool {
 }
 
 fn complete(backend: Arc<Backend>, result: Result<String, String>) {
+    if let Ok(text) = &result {
+        append_log(&backend.paths.logs.join("launcher.log"), text);
+    }
     *backend.snapshot.lock().unwrap() = refresh_discovery(&backend.paths);
     backend.refresh.initialized.store(true, Ordering::Release);
     {
@@ -653,15 +721,15 @@ fn complete(backend: Arc<Backend>, result: Result<String, String>) {
         p.busy = false;
         p.cancelable = false;
         p.text = match &result {
-            Ok(text) | Err(text) => text.clone(),
+            Ok(text) | Err(text) => text.lines().next().unwrap_or_default().to_owned(),
         };
     }
     CANCEL.store(false, Ordering::Release);
     dispatch(move |panel| {
-        if let Err(error) = result {
-            if error != "操作已取消" {
-                panel.error(error);
-            }
+        match result {
+            Err(error) if error != "操作已取消" => panel.error(error),
+            Ok(text) if text.contains('\n') => panel.modal("更新结果", &text, false),
+            _ => {}
         }
         panel.sync();
     });

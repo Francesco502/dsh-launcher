@@ -58,7 +58,12 @@ jobs:
         run: node --test .github/scripts/test-browser-entry.cjs
 
       - name: Test plugin selection and startup overrides
-        run: node --test .github/scripts/test-plugin-bridge.cjs .github/scripts/test-plugin-repair.cjs
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $env:DSH_TEST_NPM_CLI = Join-Path (Split-Path (Get-Command npm.cmd).Source) 'node_modules\npm\bin\npm-cli.js'
+          node --test .github/scripts/test-plugin-bridge.cjs .github/scripts/test-plugin-repair.cjs .github/scripts/test-plugin-update.cjs .github/scripts/test-plugin-update-integration.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Plugin tests failed' }
 
       - name: Test private graceful stop pipe
         run: node --test .github/scripts/test-stop-pipe.cjs
@@ -291,10 +296,11 @@ jobs:
               "",
               $section.Groups[1].Value.Trim(),
               "",
-              "UI powered by [Slint](https://slint.dev), used under [Slint Royalty-free License 2.0](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_REF_NAME/licenses/Slint-Royalty-free-2.0.md). Slint attribution is also available in the application About view. Project source remains MIT licensed; third-party code retains its own licenses.",
+              "[![Made with Slint](https://raw.githubusercontent.com/slint-ui/slint/v1.17.1/logo/MadeWithSlint-logo-whitebg.png)](https://slint.dev)",
+              "UI powered by [Slint](https://slint.dev), used under [Slint Royalty-free License 2.0](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:GITHUB_REF_NAME/licenses/Slint-Royalty-free-2.0.md). Project source remains MIT licensed; third-party code retains its own licenses.",
               "CLI compatibility: the public commands are start, stop, upgrade, and open. The removed restart, repair, migrate, launcher-update, data, and --data-dir forms are no longer accepted.",
               "Runtime requirement: DSH-Launcher-Portable-x64.zip is the supported lightweight package and contains no Node.js or DSH runtime. Install Node.js separately when it is absent; DSH installation and upgrades are explicit user actions.",
-              "Launcher updates: use the footer Check for launcher updates action, confirm the newer release, then let the launcher download, verify and transactionally replace the four portable program files. Failed readiness restores the old file group; DSH and user data remain intact. The first upgrade from 0.3.3 to 0.4.0 still requires installing the full portable bundle.",
+              "Launcher updates: click the centered footer version to open About, then choose Check for updates. Confirm the newer release to download, verify and transactionally replace the four portable program files. Failed readiness restores the old file group; DSH and user data remain intact. The first upgrade from 0.3.3 to 0.4.0 still requires installing the full portable bundle.",
               "DSH-Launcher.exe is a technical asset and is not a standalone portable package."
             ) -join "`n"
           }

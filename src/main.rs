@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod dsh_update;
+mod joint_update;
 mod lifecycle;
 mod log_relay;
 mod native_deps;
@@ -60,8 +61,15 @@ const PORTABLE_MARKER: &str = "portable.flag";
 const MANIFEST_FILE: &str = "runtime-manifest.json";
 const MANIFEST_TEXT: &str = include_str!("../runtime-manifest.json");
 const DATA_DIRECTORY: &str = "data";
+// Compiled only for isolated lifecycle QA; public release builds keep port 3080.
+#[cfg(not(feature = "test-isolated-port"))]
 const DSH_PORT: u16 = 3080;
+#[cfg(feature = "test-isolated-port")]
+const DSH_PORT: u16 = 3081;
+#[cfg(not(feature = "test-isolated-port"))]
 const WEB_URL: &str = "http://127.0.0.1:3080/";
+#[cfg(feature = "test-isolated-port")]
+const WEB_URL: &str = "http://127.0.0.1:3081/";
 const NODE_DOWNLOAD_URL: &str = "https://nodejs.org/en/download";
 const RELEASE_API_URL: &str =
     "https://api.github.com/repos/Francesco502/dsh-launcher/releases/latest";
@@ -801,7 +809,13 @@ fn start_installation(paths: &Paths, installation: &Installation) -> Result<Stri
     if let Some(patch) = plugins::startup_patch(paths, installation)? {
         command.arg("--patch").arg(patch);
     }
-    command.args(["--no-open", "--host", "127.0.0.1", "--port", "3080"]);
+    command.args([
+        "--no-open",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &DSH_PORT.to_string(),
+    ]);
     if installation.profile == ProfileMode::Portable {
         fs::create_dir_all(&paths.profile)
             .map_err(|error| format!("无法创建便携配置目录：{error}"))?;
@@ -1088,6 +1102,9 @@ fn install_or_update(
     progress: &dyn Fn(&str, bool),
     confirm: Option<&dyn Fn(&str) -> bool>,
 ) -> Result<String, String> {
+    if !allow_install && discover_installation(&app_paths()?).is_ok_and(|value| value.is_some()) {
+        return joint_update::update(false, progress, confirm);
+    }
     let paths = app_paths()?;
     let current = match discover_installation(&paths) {
         Ok(value) => value,
@@ -1454,6 +1471,7 @@ fn promote_stage(
 }
 
 fn recover_update_transaction(paths: &Paths) -> Result<(), String> {
+    joint_update::recover(paths)?;
     let transaction = match read_transaction(paths) {
         Ok(Some(transaction)) => transaction,
         Ok(None) if paths.repair_file().is_file() => return Ok(()),
@@ -2044,7 +2062,7 @@ where
 }
 
 fn request_probe(url: &str, cookie: Option<&str>, deadline: Instant) -> Option<Vec<u8>> {
-    let target = url.strip_prefix("http://127.0.0.1:3080")?;
+    let target = url.strip_prefix(WEB_URL.trim_end_matches('/'))?;
     if !target.starts_with('/')
         || target
             .bytes()
@@ -2069,7 +2087,7 @@ fn request_probe_at(
         .map(|value| format!("Cookie: {value}\r\n"))
         .unwrap_or_default();
     let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:3080\r\n{cookie}Connection: close\r\n\r\n"
+        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{DSH_PORT}\r\n{cookie}Connection: close\r\n\r\n"
     );
     let mut pending = request.as_bytes();
     while !pending.is_empty() {

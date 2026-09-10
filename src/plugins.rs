@@ -63,7 +63,7 @@ fn inspect_settings(
 ) -> Result<serde_json::Value, String> {
     inspect_mode(paths, installation, settings, "")
 }
-fn inspect_mode(
+pub(super) fn inspect_mode(
     paths: &Paths,
     installation: &Installation,
     settings: &Path,
