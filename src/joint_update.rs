@@ -421,6 +421,7 @@ pub(super) fn update(
         }
         validate(&paths, &record)?;
         progress("正在提交更新，此阶段不可取消…", false);
+        CANCEL.store(false, Ordering::Release);
         record["phase"] = "committing".into();
         save(&paths, &record)?;
         if was_running {
