@@ -14,6 +14,60 @@ struct OperationProgress {
     cancelable: bool,
 }
 
+struct Controls {
+    main_label: &'static str,
+    main_enabled: bool,
+    web_enabled: bool,
+    exit_enabled: bool,
+}
+
+fn controls(
+    snapshot: &Snapshot,
+    progress: &OperationProgress,
+    ready: bool,
+    modal: bool,
+) -> Controls {
+    let button = main_button(
+        snapshot,
+        progress.busy || !ready,
+        progress.cancelable && ready,
+    );
+    Controls {
+        main_label: match button {
+            MainButton::Start => "启动 DSH",
+            MainButton::Stop => "停止 DSH",
+            MainButton::InstallDsh => "安装 DSH",
+            MainButton::InstallNode => "安装 Node.js",
+            MainButton::RepairDsh => "重新安装 DSH",
+            MainButton::Cancel => "取消",
+            MainButton::Busy => "正在处理…",
+        },
+        main_enabled: ready && button != MainButton::Busy && !modal,
+        web_enabled: ready && snapshot.healthy && !progress.busy && !modal,
+        exit_enabled: ready && !progress.busy && !modal,
+    }
+}
+
+fn error_summary(text: &str) -> String {
+    // Update errors put the recovery outcome first, followed by the cause.
+    // Keep both visible; diagnostic output remains in the expandable details.
+    if text.is_empty() {
+        return "操作未完成".into();
+    }
+    text.lines()
+        .take(2)
+        .map(|line| {
+            let summary = line.chars().take(120).collect::<String>();
+            if line.chars().count() > 120 {
+                format!("{summary}…")
+            } else {
+                summary
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 struct Backend {
     paths: Paths,
     snapshot: Mutex<Snapshot>,
@@ -125,7 +179,7 @@ pub(super) fn run() -> Result<(), String> {
     tray.on_open_web(|| dispatch(|panel| panel.action("web")));
     tray.on_exit_app(|| {
         dispatch(|panel| {
-            if !panel.backend.progress.lock().unwrap().busy {
+            if panel.tray.get_exit_enabled() {
                 lifecycle::release_observer();
                 let _ = slint::quit_event_loop();
             }
@@ -213,7 +267,7 @@ impl Panel {
             self.prompt = Some(Prompt::Discard { close: true });
             self.modal(
                 "放弃未保存的更改？",
-                "插件选择尚未保存。返回将保留原设置。",
+                "放弃修改将丢弃本次未保存的勾选，保留已保存的插件设置并关闭窗口。继续编辑将返回插件列表。",
                 true,
             );
             return;
@@ -227,14 +281,22 @@ impl Panel {
         }
         self.catalog = None;
         self.view_generation = self.view_generation.wrapping_add(1);
+        self.sync();
     }
 
     fn sync(&self) {
         let snapshot = self.backend.snapshot.lock().unwrap().clone();
         let progress = self.backend.progress.lock().unwrap();
         let ready = self.backend.refresh.initialized.load(Ordering::Acquire);
-        self.tray.set_running(snapshot.healthy);
-        self.tray.set_busy(progress.busy || !ready);
+        let modal =
+            self.prompt.is_some() || self.window.as_ref().is_some_and(|w| w.get_modal_visible());
+        let controls = controls(&snapshot, &progress, ready, modal);
+        self.tray.set_running(snapshot.running);
+        self.tray.set_healthy(snapshot.healthy);
+        self.tray.set_main_label(controls.main_label.into());
+        self.tray.set_main_enabled(controls.main_enabled);
+        self.tray.set_web_enabled(controls.web_enabled);
+        self.tray.set_exit_enabled(controls.exit_enabled);
         if let Some(window) = &self.window {
             window.set_running(snapshot.healthy);
             window.set_initialized(ready);
@@ -255,21 +317,9 @@ impl Panel {
                 .into(),
             );
             window.set_busy(progress.busy);
-            let button = main_button(&snapshot, progress.busy || !ready, progress.cancelable);
-            window.set_main_label(
-                match button {
-                    MainButton::Start => "启动 DSH",
-                    MainButton::Stop => "停止 DSH",
-                    MainButton::InstallDsh => "安装 DSH",
-                    MainButton::InstallNode => "安装 Node.js",
-                    MainButton::RepairDsh => "重新安装 DSH",
-                    MainButton::Cancel => "取消",
-                    MainButton::Busy => "正在处理…",
-                }
-                .into(),
-            );
-            window.set_main_enabled(button != MainButton::Busy);
-            window.set_web_enabled(snapshot.healthy && !progress.busy);
+            window.set_main_label(controls.main_label.into());
+            window.set_main_enabled(controls.main_enabled);
+            window.set_web_enabled(controls.web_enabled);
             window.set_restart_enabled(restart_allowed(&snapshot, progress.busy));
             window.set_plugins_enabled(ready && !progress.busy && snapshot.installation.is_some());
             window.set_update_enabled(
@@ -324,24 +374,17 @@ impl Panel {
             window.set_copy_label("复制详情".into());
             window.set_details_expanded(false);
             window.set_confirming(confirming);
+            window.set_discarding(matches!(self.prompt, Some(Prompt::Discard { .. })));
             window.set_modal_visible(true);
         }
+        self.sync();
     }
 
     fn error(&mut self, text: String) {
         append_log(&self.backend.paths.logs.join("launcher.log"), &text);
         self.error = Some(text.clone());
         if let Some(window) = &self.window {
-            let line = text.lines().next().unwrap_or("操作未完成");
-            let summary = line.chars().take(120).collect::<String>();
-            window.set_error_summary(
-                if line.chars().count() > 120 {
-                    format!("{summary}…")
-                } else {
-                    summary
-                }
-                .into(),
-            );
+            window.set_error_summary(error_summary(&text).into());
             window.set_error_recovery(text.contains("插件") || text.contains("profile"));
         }
         self.modal(
@@ -376,12 +419,13 @@ impl Panel {
             _ => {}
         }
         self.error = None;
+        self.sync();
     }
 
     fn leave_plugins(&mut self) {
         if self.window.as_ref().is_some_and(|w| w.get_dirty()) {
             self.prompt = Some(Prompt::Discard { close: false });
-            self.modal("放弃未保存的更改？", "取消会保留原插件设置。", true);
+            self.modal("放弃未保存的更改？", "放弃修改将丢弃本次未保存的勾选，保留已保存的插件设置并返回主页。继续编辑将返回插件列表。", true);
         } else {
             self.view_generation = self.view_generation.wrapping_add(1);
             if let Some(window) = &self.window {
@@ -467,13 +511,13 @@ impl Panel {
                         false,
                     );
                 } else {
-                    let backend = self.begin("正在检查所选插件更新…", true);
+                    let backend = self.begin("正在检查已启用插件更新…", true);
                     thread::spawn(move || {
                         let result = (|| {
                             let _guard = acquire_action_mutex().ok_or("已有启动器操作正在执行")?;
                             recover_for_use(&backend.paths)?;
                             joint_update::update(
-                                true,
+                                joint_update::UpdateTarget::EnabledPlugins,
                                 &|text, cancelable| progress(&backend, text, cancelable),
                                 Some(&confirm),
                             )
@@ -774,6 +818,70 @@ fn copy_text(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_controls_cover_unhealthy_running_modal_and_busy_states() {
+        let mut snapshot = Snapshot::default();
+        let mut progress = OperationProgress::default();
+        assert_eq!(
+            controls(&snapshot, &progress, true, false).main_label,
+            "安装 Node.js"
+        );
+        snapshot.node_available = true;
+        snapshot.npm_available = true;
+        assert_eq!(
+            controls(&snapshot, &progress, true, false).main_label,
+            "安装 DSH"
+        );
+        snapshot.repair_needed = true;
+        assert_eq!(
+            controls(&snapshot, &progress, true, false).main_label,
+            "重新安装 DSH"
+        );
+        snapshot.running = true;
+        snapshot.auth_unavailable = true;
+        let state = controls(&snapshot, &progress, true, false);
+        assert_eq!(state.main_label, "停止 DSH");
+        assert!(state.main_enabled);
+        assert!(!state.web_enabled);
+        snapshot.healthy = true;
+        for ready in [false, true] {
+            for modal in [false, true] {
+                let state = controls(&snapshot, &progress, ready, modal);
+                assert_eq!(state.main_enabled, ready && !modal);
+                assert_eq!(state.web_enabled, ready && !modal);
+                assert_eq!(state.exit_enabled, ready && !modal);
+            }
+        }
+        progress.busy = true;
+        assert!(!controls(&snapshot, &progress, true, false).main_enabled);
+        progress.cancelable = true;
+        let state = controls(&snapshot, &progress, true, false);
+        assert_eq!(state.main_label, "取消");
+        assert!(state.main_enabled);
+        assert!(!state.web_enabled && !state.exit_enabled);
+        assert!(!controls(&snapshot, &progress, true, true).main_enabled);
+        assert!(!controls(&snapshot, &progress, false, false).main_enabled);
+    }
+
+    #[test]
+    fn error_summary_keeps_recovery_outcome_and_bounded_cause_visible() {
+        for outcome in [
+            "提交前失败，原安装未变。",
+            "失败后已恢复原版本和原运行状态。",
+            "恢复或清理未完成，已保留事务记录与剩余备份。",
+        ] {
+            let text = format!(
+                "{outcome}\n{}\n恢复详情：待处理的文件占用",
+                "错".repeat(150)
+            );
+            let summary = error_summary(&text);
+            assert_eq!(summary.lines().next(), Some(outcome));
+            assert_eq!(summary.lines().nth(1).unwrap().chars().count(), 121);
+            assert!(!summary.contains("恢复详情"));
+        }
+        assert_eq!(error_summary("普通错误"), "普通错误");
+    }
 
     fn resources() -> (usize, u32) {
         use windows_sys::Win32::System::ProcessStatus::{

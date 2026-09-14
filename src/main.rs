@@ -1103,9 +1103,10 @@ fn install_or_update(
     confirm: Option<&dyn Fn(&str) -> bool>,
 ) -> Result<String, String> {
     if !allow_install && discover_installation(&app_paths()?).is_ok_and(|value| value.is_some()) {
-        return joint_update::update(false, progress, confirm);
+        return joint_update::update(joint_update::UpdateTarget::Dsh, progress, confirm);
     }
     let paths = app_paths()?;
+    joint_update::require_clean_transaction(&paths)?;
     let current = match discover_installation(&paths) {
         Ok(value) => value,
         Err(error) if paths.managed_package().exists() => {
@@ -1471,7 +1472,13 @@ fn promote_stage(
 }
 
 fn recover_update_transaction(paths: &Paths) -> Result<(), String> {
-    joint_update::recover(paths)?;
+    if let Some(warning) = joint_update::recover(paths)? {
+        append_log(
+            &paths.logs.join("launcher.log"),
+            &format!("更新成功，清理待重试：{warning}"),
+        );
+        return Ok(());
+    }
     let transaction = match read_transaction(paths) {
         Ok(Some(transaction)) => transaction,
         Ok(None) if paths.repair_file().is_file() => return Ok(()),
@@ -1559,7 +1566,11 @@ fn recovery_failed(paths: &Paths, candidate: &Path, reason: &str) -> Result<(), 
 
 fn recover_for_use(paths: &Paths) -> Result<(), String> {
     match recover_update_transaction(paths) {
-        Err(error) if paths.repair_file().is_file() && !paths.transaction_file().exists() => {
+        Err(error)
+            if paths.repair_file().is_file()
+                && !paths.transaction_file().exists()
+                && !paths.state.join("joint-update.json").exists() =>
+        {
             append_log(&paths.logs.join("launcher.log"), &error);
             Ok(())
         }

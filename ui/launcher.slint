@@ -62,20 +62,24 @@ export component LauncherTray inherits SystemTrayIcon {
     in-out property <bool> shown: true;
     visible: root.shown;
     in property <bool> running;
-    in property <bool> busy;
+    in property <bool> healthy;
+    in property <string> main-label;
+    in property <bool> main-enabled;
+    in property <bool> web-enabled;
+    in property <bool> exit-enabled;
     callback show-panel();
     callback main-action();
     callback open-web();
     callback exit-app();
-    icon: running ? @image-url("whale-blue.svg") : @image-url("whale.svg");
+    icon: healthy ? @image-url("whale-blue.svg") : @image-url("whale.svg");
     tooltip: running ? "DSH运行中" : "DSH未启动";
     clicked => { root.show-panel(); }
     Menu {
         MenuItem { title: "打开面板"; activated => { root.show-panel(); } }
-        MenuItem { title: running ? "停止 DSH" : "启动 DSH"; enabled: !busy; activated => { root.main-action(); } }
-        MenuItem { title: "打开 Web UI"; enabled: running && !busy; activated => { root.open-web(); } }
+        MenuItem { title: root.main-label; enabled: root.main-enabled; activated => { root.main-action(); } }
+        MenuItem { title: "打开 Web UI"; enabled: root.web-enabled; activated => { root.open-web(); } }
         MenuSeparator {}
-        MenuItem { title: "退出"; enabled: !busy; activated => { root.exit-app(); } }
+        MenuItem { title: "退出"; enabled: root.exit-enabled; activated => { root.exit-app(); } }
     }
 }
 
@@ -114,6 +118,7 @@ export component LauncherWindow inherits Window {
     in property <bool> error-recovery;
     in-out property <bool> details-expanded;
     in property <bool> confirming;
+    in property <bool> discarding;
     in property <bool> modal-visible;
     changed modal-visible => {
         FocusReturn.modal = root.modal-visible;
@@ -173,7 +178,7 @@ export component LauncherWindow inherits Window {
             }
             HorizontalLayout {
                 spacing: 12px;
-                Button { text: "更新所选插件"; enabled: root.can-save && !root.busy && !root.modal-visible; clicked => { root.action("update-plugins"); } }
+                Button { text: "更新已启用插件"; enabled: root.can-save && !root.busy && !root.modal-visible; clicked => { root.action("update-plugins"); } }
                 Button { text: "修复依赖"; enabled: root.can-repair && !root.busy && !root.modal-visible; clicked => { root.action("repair-plugins"); } }
             }
             HorizontalLayout {
@@ -217,9 +222,8 @@ export component LauncherWindow inherits Window {
                     Text { text: root.modal-title == "操作未完成" && !root.details-expanded ? root.error-summary : root.modal-text; color: #30343b; wrap: word-wrap; min-width: 0px; min-height: self.preferred-height; vertical-stretch: 0; }
                     if root.modal-title == "DSH 启动器": HorizontalLayout {
                         padding-top: 20px; spacing: 12px;
-                        Button { text: "检查更新"; clicked => { root.action("launcher-update"); } }
-                        Button { text: "访问 GitHub 项目"; text-only: true; clicked => { root.action("project"); } }
-                        Rectangle { horizontal-stretch: 1; }
+                        SecondaryButton { text: "检查更新"; clicked => { root.action("launcher-update"); } }
+                        SecondaryButton { text: "访问 GitHub 项目"; clicked => { root.action("project"); } }
                     }
                     Rectangle { vertical-stretch: 1; }
                 }
@@ -228,8 +232,8 @@ export component LauncherWindow inherits Window {
                 spacing: 12px;
                 if root.modal-title != "DSH 启动器": Button { text: root.copy-label; clicked => { root.action("copy"); } }
                 Rectangle { horizontal-stretch: 1; }
-                if root.confirming: Button { text: "取消"; clicked => { root.answer(false); } }
-                Button { text: root.confirming ? "确认" : "确定"; clicked => { root.answer(true); } }
+                if root.confirming: Button { text: root.discarding ? "继续编辑" : "取消"; clicked => { root.answer(false); } }
+                Button { text: root.discarding ? "放弃修改" : root.confirming ? "确认" : "确定"; clicked => { root.answer(true); } }
             }
         }
       }
