@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-09-16
+
+### Fixed
+
+- 修复启动环境 PATH 缺少 Windows PowerShell 时，停止、重启和更新因“无法查询进程命令行：program not found”失败的问题；系统工具改用 Windows 系统目录的绝对路径，保留进程身份校验和更新回滚保护。
+
 ## [0.5.2] - 2026-09-14
 
 ### Changed

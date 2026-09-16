@@ -1940,7 +1940,25 @@ fn run_capture(
 }
 
 fn hidden_command(program: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(program);
+    let program = program.as_ref();
+    let system_relative = match program.to_str() {
+        Some("powershell.exe") => Some(r"WindowsPowerShell\v1.0\powershell.exe"),
+        Some("netstat.exe") => Some("netstat.exe"),
+        Some("taskkill.exe") => Some("taskkill.exe"),
+        Some("cmd.exe") => Some("cmd.exe"),
+        _ => None,
+    };
+    // System tools must not depend on the launching shell's PATH.
+    let system_program = system_relative.and_then(|relative| {
+        use std::os::windows::ffi::OsStringExt;
+        use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+        let mut buffer = vec![0u16; 32768];
+        let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+        (length > 0 && (length as usize) < buffer.len()).then(|| {
+            PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize])).join(relative)
+        })
+    });
+    let mut command = Command::new(system_program.as_deref().map_or(program, Path::as_os_str));
     command.creation_flags(CREATE_NO_WINDOW_FLAG);
     command
 }
@@ -2845,6 +2863,23 @@ fn first_line(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_queries_work_without_path() {
+        for program in ["powershell.exe", "netstat.exe", "taskkill.exe", "cmd.exe"] {
+            assert!(Path::new(hidden_command(program).get_program()).is_absolute());
+        }
+        let mut command = hidden_command("powershell.exe");
+        command.env("PATH", "").args([
+            "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+            "$p=Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\" -ErrorAction Stop; [Console]::Out.Write($p.CommandLine)",
+        ]);
+        let (status, stdout) = short_command_output(&mut command, CIM_QUERY_TIMEOUT).unwrap();
+        assert!(status.success());
+        assert!(String::from_utf8_lossy(&stdout).contains("powershell.exe"));
+        let custom = Path::new(r"D:\Custom\node.exe");
+        assert_eq!(hidden_command(custom).get_program(), custom.as_os_str());
+    }
 
     #[test]
     fn reopen_window_identity_matches_the_installation_mutex() {
