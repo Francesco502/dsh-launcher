@@ -2067,7 +2067,8 @@ where
         return ProbeResponse::NotDsh;
     };
     // Current DSH exchanges its launch token for a browser cookie, then sends
-    // a 303 to /. Follow only that local exchange, with no persistent cookie.
+    // a 303 to / (older DSH) or ./ (0.1.7). Both resolve to our fixed root.
+    // Follow only that local exchange, with no persistent cookie.
     if url != WEB_URL && headers.split_whitespace().nth(1) == Some("303") {
         let header = |name: &str| {
             headers.lines().skip(1).find_map(|line| {
@@ -2080,7 +2081,7 @@ where
             .filter(|value| {
                 value.contains('=') && value.bytes().all(|byte| byte.is_ascii_graphic())
             });
-        if header("location") != Some("/") || cookie.is_none() {
+        if !matches!(header("location"), Some("/" | "./")) || cookie.is_none() {
             return ProbeResponse::NotDsh;
         }
         return request(WEB_URL, cookie)
@@ -3231,37 +3232,42 @@ mod tests {
     #[test]
     fn authenticated_redirect_requires_cookie_and_verified_home_page() {
         let url = "http://127.0.0.1:3080/?token=test-token";
-        let redirect = b"HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: dsh=test-cookie; HttpOnly; Path=/\r\n\r\n";
-        for (body, expected) in [
-            ("HTTP/1.1 200 OK\r\n\r\n__DSH_BOOT__", ProbeResponse::Ready),
-            (
-                "HTTP/1.1 200 OK\r\n\r\nordinary page",
-                ProbeResponse::NotDsh,
-            ),
-            (
-                "HTTP/1.1 401 Unauthorized\r\n\r\ndsh web authentication required",
-                ProbeResponse::AuthenticationRequired,
-            ),
-        ] {
-            let mut calls = Vec::new();
-            let result = probe_url_with(url, |target, cookie| {
-                calls.push((target.to_owned(), cookie.map(str::to_owned)));
-                Some(if cookie.is_none() {
-                    redirect.to_vec()
-                } else {
-                    body.as_bytes().to_vec()
-                })
-            });
-            assert_eq!(result, expected);
-            assert_eq!(
-                calls,
-                vec![
-                    (url.to_owned(), None),
-                    (WEB_URL.to_owned(), Some("dsh=test-cookie".to_owned()))
-                ]
-            );
+        for location in ["/", "./"] {
+            let redirect = format!("HTTP/1.1 303 See Other\r\nLocation: {location}\r\nSet-Cookie: dsh=test-cookie; HttpOnly; Path=/\r\n\r\n");
+            for (body, expected) in [
+                ("HTTP/1.1 200 OK\r\n\r\n__DSH_BOOT__", ProbeResponse::Ready),
+                (
+                    "HTTP/1.1 200 OK\r\n\r\nordinary page",
+                    ProbeResponse::NotDsh,
+                ),
+                (
+                    "HTTP/1.1 401 Unauthorized\r\n\r\ndsh web authentication required",
+                    ProbeResponse::AuthenticationRequired,
+                ),
+            ] {
+                let mut calls = Vec::new();
+                let result = probe_url_with(url, |target, cookie| {
+                    calls.push((target.to_owned(), cookie.map(str::to_owned)));
+                    Some(if cookie.is_none() {
+                        redirect.as_bytes().to_vec()
+                    } else {
+                        body.as_bytes().to_vec()
+                    })
+                });
+                assert_eq!(result, expected);
+                assert_eq!(
+                    calls,
+                    vec![
+                        (url.to_owned(), None),
+                        (WEB_URL.to_owned(), Some("dsh=test-cookie".to_owned()))
+                    ]
+                );
+            }
         }
         for response in [
+            "HTTP/1.1 303 See Other\r\nLocation: ./\r\n\r\n",
+            "HTTP/1.1 303 See Other\r\nLocation: //example.com/\r\nSet-Cookie: dsh=test\r\n\r\n",
+            "HTTP/1.1 303 See Other\r\nLocation: ./other\r\nSet-Cookie: dsh=test\r\n\r\n",
             "HTTP/1.1 303 See Other\r\nLocation: /\r\n\r\n",
             "HTTP/1.1 303 See Other\r\nLocation: http://example.com/\r\nSet-Cookie: dsh=test\r\n\r\n",
             "HTTP/1.1 303 See Other\r\nLocation: /\r\nSet-Cookie: invalid\r\n\r\n",
